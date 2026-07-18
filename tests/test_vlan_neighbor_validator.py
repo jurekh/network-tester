@@ -215,23 +215,55 @@ def test_icmp_unreachable_expected_peer_failure(fake_tools):
     assert "r1-data-01" in finding["hint"]
 
 
-def test_capture_window_held_open_for_full_cap(fake_tools):
-    """The passive capture stays open for the whole window even when the
-    arping phase finishes early, so nodes with no expected peers still
-    detect strangers (the wrong-vlan fault relies on this)."""
+class _FakeClock:
+    """monotonic() driven by the patched cancellation.wait, so window-length
+    behavior is testable without real sleeps."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+
+def _run_with_fake_window(fake_tools, monkeypatch, window):
     fake_tools["arp"][PEER_IP] = True
     fake_tools["ping3"][PEER_IP] = PING_OK
     section = probe_runner.empty_section("vlan_neighbor_validator")
     cancellation = probe_runner.Cancellation()
+    clock = _FakeClock()
     waits = []
-    cancellation.wait = lambda timeout: (waits.append(timeout), False)[1]
-    vlan.CAPTURE_WINDOW_SECONDS = 30
-    try:
-        vlan.run(TOPOLOGY, NODE, section, cancellation)
-    finally:
-        vlan.CAPTURE_WINDOW_SECONDS = 0
+
+    def fake_wait(timeout):
+        waits.append(timeout)
+        clock.now += timeout
+        return False
+
+    cancellation.wait = fake_wait
+    monkeypatch.setattr(vlan.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(vlan, "CAPTURE_WINDOW_SECONDS", window)
+    vlan.run(TOPOLOGY, NODE, section, cancellation)
+    return section, waits
+
+
+def test_capture_window_held_open_for_full_cap(fake_tools, monkeypatch):
+    """The passive capture stays open for the whole window even when the
+    arping phase finishes early, so nodes with no expected peers still
+    detect strangers (the wrong-vlan fault relies on this)."""
+    section, waits = _run_with_fake_window(fake_tools, monkeypatch, 30)
     assert section["validator_status"] == "complete"
-    assert waits and waits[0] > 25  # held nearly the whole 30s window
+    assert sum(waits) > 25  # held nearly the whole 30s window
+
+
+def test_arping_sweep_repeats_across_capture_window(fake_tools, monkeypatch):
+    """The arping sweep repeats until the window closes: the sweep is this
+    node's transmission that concurrent observers passively classify, and
+    probe start times skew across units, so a single burst at window-open
+    would be invisible to an observer whose window opened slightly later."""
+    _run_with_fake_window(fake_tools, monkeypatch, 30)
+    arpings = [c for c in fake_tools["calls"] if c[0] == "arping"]
+    assert len(arpings) >= 4  # one sweep per SWEEP_INTERVAL_SECONDS, not one total
+    assert all(c == ["arping", "-I", "eth0", "-c", "1", "-w", "2", PEER_IP] for c in arpings)
 
 
 # --- cancellation contract (4.6 carry-over) -----------------------------------------

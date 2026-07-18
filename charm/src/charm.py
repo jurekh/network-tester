@@ -71,7 +71,17 @@ class NetworkTesterCharm(ops.CharmBase):
         self.unit.status = ops.ActiveStatus("ready")
 
     def _on_config_changed(self, event: ops.ConfigChangedEvent):
-        """Leader propagates a non-empty probe-run-id to peer relation data."""
+        """Run the probe on a non-empty probe-run-id; leader also propagates it.
+
+        Every unit probes from config-changed, not from the leader's relation
+        write: the app-databag write only commits when the leader's hook exits,
+        and the leader used to probe inside that same hook, so peers started a
+        full probe-duration later and passive capture windows never overlapped
+        the leader's traffic. config-changed reaches all units within seconds
+        of the CLI's `juju config`, keeping the windows concurrent. The
+        relation write stays as the catch-up path for units that missed the
+        config event (the last-run guard dedups the double trigger).
+        """
         run_id = str(self.config["probe-run-id"])
         if not run_id:
             return
@@ -79,9 +89,7 @@ class NetworkTesterCharm(ops.CharmBase):
             relation = self.model.get_relation(PEER_RELATION)
             if relation is not None:
                 relation.data[self.app]["probe-run-id"] = run_id
-            # Juju does not re-notify the writer of its own app-data change,
-            # so the leader triggers its own probe run directly.
-            self._maybe_run_probe(run_id)
+        self._maybe_run_probe(run_id)
 
     def _on_peer_relation_changed(self, event: ops.RelationChangedEvent):
         """Run the probe payload when a new probe-run-id appears."""

@@ -33,16 +33,16 @@ The leader unit SHALL watch the `config-changed` hook for the `probe-run-id` app
 - **WHEN** all units have joined the peer relation but `probe-run-id` in relation data is absent or empty
 - **THEN** no unit SHALL begin probing
 
-### Requirement: Each unit begins probing only when probe-run-id in relation data differs from its last-executed run
-Each unit SHALL check the peer relation data for `probe-run-id` before starting probes. If `probe-run-id` is absent or empty, the unit SHALL NOT begin probing. If `probe-run-id` is non-empty and differs from the value stored in `/var/lib/network-tester/last-probe-run-id`, the unit SHALL run probes and write the new run-id to that file after completing. Units SHALL NOT send any probe traffic before a new `probe-run-id` is observed.
+### Requirement: Each unit begins probing only when a new probe-run-id differs from its last-executed run
+Every unit (leader and non-leader) SHALL run probes from its own `config-changed` hook when `probe-run-id` is non-empty and differs from the value stored in `/var/lib/network-tester/last-probe-run-id`, writing the new run-id to that file after completing. Probing from `config-changed` rather than from the leader's relation-data write keeps capture windows concurrent across units: relation data written by the leader only commits when the leader's hook exits, so units waiting on `peer-relation-changed` would start a full probe-duration after the leader and passive cross-observation (e.g. unexpected-l2-neighbor) would structurally miss the leader's traffic. The `peer-relation-changed` path SHALL remain as a catch-up trigger with identical semantics (same last-run-id dedup guard) for units that missed the config event. If `probe-run-id` is absent or empty, the unit SHALL NOT begin probing; units SHALL NOT send any probe traffic before a new `probe-run-id` is observed.
 
 #### Scenario: Unit sees no probe-run-id yet
-- **WHEN** a unit's `peer-relation-changed` hook fires and `probe-run-id` in relation data is absent or empty
-- **THEN** the unit SHALL return from the hook without probing; probing will be triggered on the next `peer-relation-changed` event when the leader sets the value
+- **WHEN** a unit's `config-changed` or `peer-relation-changed` hook fires and `probe-run-id` is absent or empty
+- **THEN** the unit SHALL return from the hook without probing
 
 #### Scenario: Unit receives new probe-run-id
-- **WHEN** the leader sets a new `probe-run-id` in relation data that differs from the unit's last-executed run-id
-- **THEN** the unit SHALL begin its probe sequence
+- **WHEN** `probe-run-id` is set to a value that differs from the unit's last-executed run-id
+- **THEN** the unit SHALL begin its probe sequence from its own `config-changed` hook, concurrently with the other units
 
 #### Scenario: Unit sees same probe-run-id as last run
 - **WHEN** `probe-run-id` in relation data matches the value in `/var/lib/network-tester/last-probe-run-id`

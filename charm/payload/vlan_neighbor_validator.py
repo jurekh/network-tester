@@ -28,6 +28,7 @@ RULE_BMC_OAM = "bmc-oam-restricted"
 # otherwise-idle nodes relies on it).
 CAPTURE_CAP_SECONDS = 30
 CAPTURE_WINDOW_SECONDS = 30
+SWEEP_INTERVAL_SECONDS = 5
 
 ETHERTYPE_ARP = 0x0806
 ETHERTYPE_VLAN = 0x8100
@@ -317,28 +318,35 @@ def run(topology, node, section, cancellation):
         _flush_unattempted(section, plans, attempted, cancellation.reason)
         return
 
-    # Phase A: passive ARP capture on every interface for the duration of
-    # the targeted arping probes (capped at CAPTURE_CAP_SECONDS).
+    # Phase A: passive ARP capture on every interface for the full window,
+    # with the targeted arping sweep repeating until the window closes
+    # (capped at CAPTURE_CAP_SECONDS). The sweep doubles as this node's
+    # transmission that concurrent observers passively classify; probe start
+    # times skew across units by a few seconds (config-changed dispatch), so
+    # a single burst at window-open would fall outside an observer window
+    # that opened slightly later or earlier.
     captures = [(plan, _start_capture(plan["local_iface"], cancellation)) for plan in plans]
     phase_start = time.monotonic()
     arp_observed = {}
     interrupted = False
-    for plan in plans:
-        for peer in plan["expected"]:
-            if cancellation.is_set() or time.monotonic() - phase_start > CAPTURE_CAP_SECONDS:
-                interrupted = cancellation.is_set()
+    while not interrupted:
+        for plan in plans:
+            for peer in plan["expected"]:
+                if cancellation.is_set() or time.monotonic() - phase_start > CAPTURE_CAP_SECONDS:
+                    interrupted = cancellation.is_set()
+                    break
+                key = (plan["interface"], peer["system_id"])
+                attempted.add(key)
+                answered = _arping(plan["local_iface"], peer["ip"], cancellation)
+                arp_observed[key] = arp_observed.get(key, False) or answered
+            if interrupted:
                 break
-            attempted.add((plan["interface"], peer["system_id"]))
-            arp_observed[(plan["interface"], peer["system_id"])] = _arping(
-                plan["local_iface"], peer["ip"], cancellation
-            )
         if interrupted:
             break
-    if not interrupted:
         remaining = CAPTURE_WINDOW_SECONDS - (time.monotonic() - phase_start)
-        if remaining > 0:
-            cancellation.wait(remaining)
-            interrupted = cancellation.is_set()
+        if remaining <= 0:
+            break
+        interrupted = cancellation.wait(min(SWEEP_INTERVAL_SECONDS, remaining))
     observed = {plan["interface"]: _stop_capture(proc) for plan, proc in captures}
     if interrupted:
         _flush_unattempted(section, plans, attempted, cancellation.reason)

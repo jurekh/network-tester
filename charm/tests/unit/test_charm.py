@@ -157,7 +157,11 @@ def test_leader_config_changed_with_empty_run_id_does_nothing(paths):
     run.assert_not_called()
 
 
-def test_non_leader_config_changed_does_not_write_or_probe(paths):
+def test_non_leader_config_changed_probes_without_writing_relation_data(paths):
+    # Every unit gets config-changed when the CLI sets probe-run-id; probing
+    # from it keeps capture windows concurrent across units (the leader's
+    # relation-data write only commits when its hook exits, so peers waiting
+    # on relation-changed would start a full probe-duration later).
     relation = testing.PeerRelation("network-tester-peers")
     ctx = make_context()
     with patch("charm.subprocess.run") as run:
@@ -170,7 +174,8 @@ def test_non_leader_config_changed_does_not_write_or_probe(paths):
             ),
         )
     assert "probe-run-id" not in state_out.get_relation(relation.id).local_app_data
-    run.assert_not_called()
+    assert_payload_invoked(run)
+    assert (paths / "last-probe-run-id").read_text() == RUN_ID
 
 
 def test_peer_relation_changed_runs_payload_for_new_run_id(paths):
