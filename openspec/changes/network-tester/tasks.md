@@ -160,3 +160,32 @@ Execution is organized into stages. Each stage delivers a vertical slice of the 
 - [x] 9.5 Finish `testbed/README.md`: network topology ascii diagram with annotations showing fault injection sites, host prerequisites, profiles and RAM sizing, full `verify` matrix, fault catalog, teardown guarantees; define CI tiers: unit/integration tests on every change, jubilant tests on an LXD-capable runner, full testbed `verify` matrix nightly or on demand on a nested-virt-capable runner (CI tiers also wired as `.github/workflows/ci.yml` (tiers 1-2) and `.github/workflows/testbed-nightly.yml` (tier 3))
 - [ ] 9.6 **[MANUAL RUNBOOK - requires real MAAS + 2 racks]** Test full charm deployment against a real MAAS instance in ephemeral mode on at least 2 nodes across 2 racks, including one injected fault (bond mode mismatch or asymmetric cable swap); confirm the 35s LACP capture window records at least one PDU on a real switch bond with `lacp_rate slow`; this is not a test suite item - execute manually and record results (operator runbook written: `docs/manual-hardware-runbook.md`; execution still pending an operator with real hardware)
 - [ ] 9.7 **Gate:** packaging checks green; docs complete; CI tiers defined and running; runbook executed and results recorded (packaging 9.1/9.2 green; docs 9.3/9.4/9.5 complete; CI tiers defined in `.github/workflows/`; remaining: execute the 9.6 manual runbook on real hardware and record results)
+
+## 10. Eliminate Dual-Stage Testbed Construction
+
+The testbed currently composes nodes on the MAAS-visible Linux PXE bridge
+(`br-pxe`), then moves/retags the boot NIC, attaches the data NICs out-of-band
+via LXD, and **recommissions** so MAAS records the real per-segment topology
+(`ensure_node_networking`). This second commission exists only because MAAS
+will not compose a VM onto an OVS bridge (its resource scanner does not report
+OVS datapath bridges / internal ports as host interfaces, so compose falls back
+to unusable macvlan NICs). In a real datacenter MAAS first-boots and commissions
+once in the day-0 topology; the dual stage is an OVS-emulation artifact. This
+phase tries to make the testbed first-boot each node in its final topology so a
+single commission records everything (and the boot NIC stays off the data
+fabric, unchanged).
+
+**Branch-first requirement:** perform all of phase 10 on a dedicated branch
+(e.g. `testbed-single-stage`). Do NOT merge to the main branch until the phase
+10 gate (10.8) passes. If single-stage proves infeasible for the data NICs,
+land the rack-2 single-commission win (10.3) and document why any remaining
+recommission stays, still gated on 10.8 before merge.
+
+- [ ] 10.1 Create the `testbed-single-stage` branch off the current main. Record a baseline on main first: clean `nt-testbed up` wall-clock, the count of commission vs recommission cycles per node, and the MAAS-recorded topology (interfaces, bonds, VLAN links, IPs, derived rack) for every node, so the refactor can be diffed against it.
+- [ ] 10.2 Investigate and document (grounded in `../maas` source and `../maas-kb`) the MAAS composition constraints that force the dual stage: whether `maas vm-host compose` can target specific host interfaces/bridges, whether it can compose without auto-commissioning (compose -> attach NICs -> commission once), exactly what MAAS reports for OVS vs Linux host bridges, and whether hardware-sync (frequency tunable) can record post-deploy NIC changes given the testbed's Ready -> fetch -> deploy ordering. Decide the viable single-stage approach from the findings.
+- [ ] 10.3 Give rack 2 a MAAS-composable boot segment: replace the OVS-only rack-2 boot path with a MAAS-visible Linux bridge whose primary rack controller is `nt-rack2`, so rack-2 nodes compose and first-boot off the correct rack controller and MAAS derives rack 2 on the first commission - removing the boot-NIC move and the rack-association recommission. Preserve the data-VLAN isolation the current access-VLAN design provides (boot NICs must not see the tagged data VLAN 100).
+- [ ] 10.4 Attach each node's full final NIC set before its single commission: boot NIC on the correct rack/mgmt segment plus data NICs as untagged OVS bond members, so one commission records the complete per-segment topology. Implement the approach chosen in 10.2 for the OVS-compose limitation (e.g. compose without auto-commission, attach OVS data NICs via LXD, then commission once). Keep the boot NIC off the data fabric.
+- [ ] 10.5 Remove the now-redundant dual-stage logic: delete the boot-NIC move/retag and the recommission in `ensure_node_networking` (and any rack-2-specific recommission) once 10.3/10.4 make them unnecessary; keep `up` idempotent and resumable on re-runs.
+- [ ] 10.6 Fetcher parity: confirm the CLI topology fetch produces an expected-topology model identical to the 10.1 baseline (interfaces, bonds, VLANs, IPs, rack derivation) after single-stage construction, so the vlan/bond/multirack/mtu/bgp checks are unaffected.
+- [ ] 10.7 Update testbed docs/comments: revise `testbed/README.md` and the relevant code comments to describe single-stage construction and remove the dual-stage rationale; update memory notes that describe the recommission flow.
+- [ ] 10.8 **Gate (branch -> main):** on a clean single-stage `nt-testbed up`, no node commissions more than once; the full `verify` matrix (foundation, topology, skeleton, vlan, bond, multirack, timeout, scale) passes; fetcher parity (10.6) holds; clean-build wall-clock is recorded and is not worse than the 10.1 baseline (or any regression is justified); `make lint test` is green. Only after this gate passes, merge `testbed-single-stage` to the main branch.
