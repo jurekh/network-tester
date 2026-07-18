@@ -20,6 +20,11 @@ import representatives
 
 # 30 hops at one query and a 2-second wait is 60s worst case; cap at 75s.
 TRACEROUTE_CAP_SECONDS = 75
+# Cross-rack reachability ICMP probe shape (`ping -c COUNT -W WAIT`). The
+# timeout-budget test derives the per-rack BGP cost (representative + fallback
+# probes plus the capped traceroute) from these constants.
+ICMP_COUNT = 2
+ICMP_WAIT_SECONDS = 2
 
 
 def _data_iface(machine):
@@ -32,7 +37,7 @@ def _data_iface(machine):
 def _icmp_ok(ip, cancellation):
     """True when the target answers ICMP echo."""
     proc = subprocess.Popen(
-        ["ping", "-c", "2", "-W", "2", ip],
+        ["ping", "-c", str(ICMP_COUNT), "-W", str(ICMP_WAIT_SECONDS), ip],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )

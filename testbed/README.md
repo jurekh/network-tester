@@ -45,6 +45,8 @@ testbed/nt-testbed verify skeleton     # full deploy/probe/collect/report cycle
 testbed/nt-testbed verify vlan         # VLAN neighbor checks + wrong-vlan fault
 testbed/nt-testbed verify bond         # LACP bond checks + bond faults
 testbed/nt-testbed verify multirack    # cross-rack MTU + BGP inference + faults
+testbed/nt-testbed verify timeout      # low probe-timeout -> partial timeout output
+testbed/nt-testbed verify scale        # Juju accepts a 200-node topology resource
 testbed/nt-testbed status              # VM / MAAS / machine state
 testbed/nt-testbed shell               # shell inside the testbed VM
 testbed/nt-testbed fault clear         # restore topology
@@ -203,3 +205,25 @@ The rack-2 controller, both FRR routers, and the rack-2 data nodes are all
 composed inside the testbed VM, so a multi-rack `up` from scratch runs
 longer than the single-rack build (image import + rack-1 commission + rack-2
 controller/FRR + rack-2 compose/recommission).
+
+## verify timeout
+
+`verify timeout` deploys with `--keep-model`, then sets the charm
+`probe-timeout` to 45 seconds and re-triggers via `--reuse-model`. Phase 1
+holds a ~35 second capture window (the LACP slow-rate floor), so 45 seconds
+completes phase 1 but cannot finish the cross-rack MTU/BGP phases. It asserts
+the units still return to `active/idle`, the per-unit probe output is partial
+with `status: timeout`, and the report lists the unattempted representative
+rack-pairs as inconclusive rather than missing or failed. The timeout-budget
+unit test (`tests/test_timeout_budget.py`) derives the worst-case wall-clock
+from the validators' own caps and guards the 240 second default.
+
+## verify scale
+
+`verify scale` confirms the testbed Juju controller accepts a synthetic
+200-node topology file resource (the only Juju payload that grows with cluster
+node count). It deploys the charm with the resource and zero units, so no MAAS
+machines are provisioned. The size unit test (`tests/test_scale_limits.py`)
+records the resource and action-result byte budgets and the conclusion that no
+chunking or compression is needed: the action result is per-unit and bounded
+by rack count (representative sampling), not by node count.

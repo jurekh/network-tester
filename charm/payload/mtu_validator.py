@@ -22,6 +22,10 @@ HEADER_BYTES = 28
 STD_PAYLOAD = 1472
 JUMBO_PAYLOAD = 8972
 BINARY_SEARCH_ITERATIONS = 5
+# Per-probe ICMP deadline (`ping -W`). Worst case is the two initial probes
+# plus BINARY_SEARCH_ITERATIONS refinements, each bounded by this; the
+# timeout-budget test derives the per-rack MTU cost from these constants.
+PROBE_WAIT_SECONDS = 2
 
 INCONCLUSIVE_NOTE = "ICMP may be filtered on this path; manual MTU verification required"
 
@@ -37,7 +41,7 @@ def _data_ip(machine):
 def _ping_df(ip, size, cancellation):
     """One DF-bit ICMP probe; returns (success, fragmentation_needed_mtu|None)."""
     proc = subprocess.Popen(
-        ["ping", "-M", "do", "-s", str(size), "-c", "1", "-W", "2", ip],
+        ["ping", "-M", "do", "-s", str(size), "-c", "1", "-W", str(PROBE_WAIT_SECONDS), ip],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,

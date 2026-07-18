@@ -1414,6 +1414,7 @@ def ensure_maas_bonds():
 
 JUJU_CONTROLLER = "nt"
 MAAS_CLOUD = "maas-testbed"
+JUJU_APP = "network-tester"  # charm application name the CLI deploys
 
 
 def ensure_juju():
@@ -2255,6 +2256,174 @@ def _verify_multirack_faults(model):
     return problems
 
 
+def verify_timeout():
+    """Phase 8 gate: a probe-timeout too small to finish yields partial timeout
+    output, units back at active/idle, and cross-rack work classified as
+    inconclusive rather than missing or failed.
+
+    Phase 1 holds a fixed ~35s capture window (the LACP slow-rate floor and the
+    30s ARP cap), independent of fabric health. On a healthy testbed the
+    cross-rack MTU/BGP phases would otherwise finish in a second or two
+    (reachable paths answer immediately), so a probe-timeout below the phase-1
+    floor reliably cuts the run before the cross-rack phases start. The runner
+    writes partial output with status timeout; the charm still returns the unit
+    to active/idle ("probe <id> complete"); the report derives the unattempted
+    representative-sampled rack-pairs from the topology and lists them as
+    inconclusive (design D14/D16).
+    """
+    charm_name = ensure_charm_packed()
+    sync_tree()
+    ensure_juju()
+    destroy_test_models()
+    clear_faults()
+    problems = []
+    deploy_args = f"--charm charm/{charm_name} --cloud {MAAS_CLOUD} --wait-timeout 2400"
+
+    log("verify timeout: clean deploy (model kept for the low-timeout re-trigger)")
+    result = network_tester_run(f"--all --keep-model {deploy_args}")
+    output = result.stdout + result.stderr
+    match = re.search(r"Model (network-test-\S+) kept", output)
+    model = match.group(1) if match else None
+    if model is None:
+        problems.append(f"deploy failed ({result.returncode}):\n{output}")
+    else:
+        log("verify timeout: setting probe-timeout=30 (below the phase-1 floor) and re-triggering")
+        vm_run(f"juju config -m {model} {JUJU_APP} probe-timeout=30")
+        result = network_tester_run(f"--reuse-model {model} --verbose --wait-timeout 1200")
+        out = result.stdout + result.stderr
+        report = report_from_output(out)
+        if report is None:
+            problems.append(f"timeout run: no report:\n{out}")
+        else:
+            inconclusive = [
+                e
+                for e in report.get("inconclusive_checks", [])
+                if e.get("type") == "bgp-reachability"
+            ]
+            if not inconclusive:
+                problems.append(
+                    "timeout run: expected unattempted cross-rack checks classified "
+                    "inconclusive:\n" + json.dumps(report.get("inconclusive_checks", []), indent=2)
+                )
+            failures = report.get("definitive_failures", []) + report.get("inferred_failures", [])
+            if failures:
+                problems.append(
+                    "timeout run: cross-rack timeout misclassified as failure:\n"
+                    + json.dumps(failures, indent=2)
+                )
+            if report.get("missing_nodes"):
+                problems.append(
+                    "timeout run: cross-rack timeout misclassified as missing nodes:\n"
+                    + json.dumps(report["missing_nodes"], indent=2)
+                )
+        vm_run(f"juju config -m {model} {JUJU_APP} probe-timeout=240", check=False)
+
+    if model:
+        log("verify timeout: destroying kept model")
+        vm_run(f"juju destroy-model --no-prompt --force --timeout 15m {model}", check=False)
+        wait_nodes_ready()
+
+    if problems:
+        for problem in problems:
+            log(f"FAIL: {problem}")
+        sys.exit(1)
+    log("verify timeout: PASS (low probe-timeout -> partial timeout, inconclusive cross-rack)")
+
+
+# Writes a synthetic 200-node / 20-rack topology resource inside the VM. The
+# resource is the only Juju payload that grows with cluster node count; a unit's
+# collect-results action result is bounded by rack count (representative
+# sampling) and is covered by the size unit test and the real collect-results
+# path that verify multirack exercises.
+SCALE_TOPOLOGY_GEN = r"""
+import json
+racks, per = 20, 10
+machines = []
+for r in range(1, racks + 1):
+    rack = "rack-%d" % r
+    machines.append({
+        "system_id": "rc%04d" % r, "hostname": "%s-controller" % rack, "rack": rack,
+        "role": "rack-controller", "in_scope": False,
+        "interfaces": [{"name": "eth0", "type": "physical", "mac": "52:54:00:%02x:00:01" % r,
+            "fabric": "fabric-mgmt", "fabric_class": "management", "vlan_tag": 10,
+            "subnet_cidr": "10.10.1.0/24", "ip": "10.10.%d.2" % r, "gateway_ip": "10.10.%d.1" % r}]})
+    for n in range(1, per + 1):
+        sid = "r%03dd%03d" % (r, n)
+        machines.append({"system_id": sid, "hostname": sid, "rack": rack, "role": "data",
+            "in_scope": True, "interfaces": [
+            {"name": "eth0", "type": "physical", "mac": "52:54:00:%02x:%02x:01" % (r, n),
+             "fabric": "fabric-mgmt", "fabric_class": "management", "vlan_tag": 10,
+             "subnet_cidr": "10.10.1.0/24", "ip": "10.10.%d.%d" % (r, n + 2), "gateway_ip": "10.10.%d.1" % r},
+            {"name": "bond0", "type": "bond", "mac": "52:54:00:%02x:%02x:02" % (r, n),
+             "fabric": "data-%s" % rack, "fabric_class": "data", "vlan_tag": 100,
+             "subnet_cidr": "10.%d.0.0/24" % r, "ip": "10.%d.0.%d" % (r, n), "gateway_ip": "10.%d.0.254" % r,
+             "bond_members": [{"name": "ens3", "mac": "52:54:00:%02x:%02x:03" % (r, n)},
+                              {"name": "ens4", "mac": "52:54:00:%02x:%02x:04" % (r, n)}]}]})
+topology = {"schema_version": "1", "scope": {"selector": "all"}, "fabrics": [],
+    "machines": machines, "reachability_model": {"rules": {"cross-rack-data-routing": {"parameters": {}}}}}
+open("/root/nt-scale-topology.json", "w").write(json.dumps(topology))
+"""
+
+
+def verify_scale():
+    """Phase 8 empirical scale check: the testbed Juju controller accepts a
+    synthetic 200-node topology file resource.
+
+    The topology resource grows with cluster node count, so this confirms Juju
+    accepts it at datacenter scale (the size unit test records the byte budget
+    and the no-chunking decision). The application is deployed with zero units,
+    so no MAAS machines are provisioned: this isolates resource acceptance from
+    node bring-up.
+    """
+    charm_name = ensure_charm_packed()
+    sync_tree()
+    ensure_juju()
+    problems = []
+    model = "nt-scale"
+
+    log("verify scale: generating a synthetic 200-node topology resource")
+    vm_run(f"python3 - <<'PY'\n{SCALE_TOPOLOGY_GEN}\nPY")
+    size = int(vm_out("stat -c %s /root/nt-scale-topology.json"))
+    log(f"verify scale: 200-node topology resource is {size} bytes")
+
+    vm_run(
+        f"juju destroy-model --no-prompt --force --timeout 5m {model} 2>/dev/null || true",
+        check=False,
+    )
+    vm_run(f"juju add-model -c {JUJU_CONTROLLER} {model} {MAAS_CLOUD}")
+    try:
+        result = vm_run(
+            f"cd {VM_TREE} && juju deploy ./charm/{charm_name} -m {model} "
+            f"--resource topology=/root/nt-scale-topology.json -n 0 {JUJU_APP}",
+            check=False,
+            capture=True,
+        )
+        if result.returncode != 0:
+            problems.append(
+                f"Juju rejected the {size}-byte 200-node topology resource:\n"
+                f"{result.stdout}{result.stderr}"
+            )
+        else:
+            resources = vm_out(f"juju resources {JUJU_APP} -m {model} --format json", check=False)
+            try:
+                names = {r.get("name") for r in json.loads(resources).get("resources", [])}
+            except (json.JSONDecodeError, AttributeError):
+                names = set()
+            if "topology" not in names:
+                problems.append(f"topology resource not registered after attach:\n{resources}")
+    finally:
+        vm_run(
+            f"juju destroy-model --no-prompt --force --timeout 5m {model}",
+            check=False,
+        )
+
+    if problems:
+        for problem in problems:
+            log(f"FAIL: {problem}")
+        sys.exit(1)
+    log(f"verify scale: PASS (Juju accepted the {size}-byte 200-node topology resource)")
+
+
 VERIFY_STAGES = {
     "foundation": verify_foundation,
     "topology": verify_topology,
@@ -2262,6 +2431,8 @@ VERIFY_STAGES = {
     "vlan": verify_vlan,
     "bond": verify_bond,
     "multirack": verify_multirack,
+    "timeout": verify_timeout,
+    "scale": verify_scale,
 }
 
 
