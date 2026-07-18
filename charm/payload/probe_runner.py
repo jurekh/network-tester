@@ -160,11 +160,20 @@ def _flush_interrupted(runs, clock):
             run.join(max(deadline - clock(), 0))
 
 
-def run_probe(topology, node, timeout_seconds, funcs=None, output_path=None, clock=time.monotonic):
+def run_probe(
+    topology,
+    node,
+    timeout_seconds,
+    funcs=None,
+    output_path=None,
+    clock=time.monotonic,
+    run_id="",
+):
     """Run all validators against the bound node record; write probe output.
 
     Returns the top-level probe status (complete, timeout, or cancelled).
-    ``funcs`` and ``output_path`` are injectable for tests.
+    ``run_id`` is stamped into the output so the collector can reject stale
+    documents. ``funcs`` and ``output_path`` are injectable for tests.
     """
     funcs = VALIDATOR_FUNCS if funcs is None else funcs
     output_path = OUTPUT_PATH if output_path is None else output_path
@@ -206,13 +215,16 @@ def run_probe(topology, node, timeout_seconds, funcs=None, output_path=None, clo
         elif run.alive() or run.section["validator_status"] == "not_started":
             # Interrupted before the validator set its own terminal status.
             run.section["validator_status"] = status
-    write_output(output_path, status, node, {name: run.section for name, run in runs.items()})
+    write_output(
+        output_path, status, node, {name: run.section for name, run in runs.items()}, run_id
+    )
     return status
 
 
-def write_output(path, status, node, sections):
+def write_output(path, status, node, sections, run_id=""):
     doc = {
         "schema_version": schemas.SCHEMA_VERSION,
+        "probe_run_id": run_id,
         "status": status,
         "node": {
             "system_id": node["system_id"],

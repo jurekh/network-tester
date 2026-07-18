@@ -1,5 +1,6 @@
 {
   "schema_version": "1",
+  "probe_run_id": "20260712-000000",
   "status": "complete",
   "node": {
     "system_id": "aaa001",
@@ -7,9 +8,18 @@
     "rack": "rack-1",
     "role": "data",
     "interfaces": [
-      {"name": "bond0", "mac": "52:54:00:01:01:01"},
-      {"name": "eno1", "mac": "52:54:00:01:01:01"},
-      {"name": "eno2", "mac": "52:54:00:01:01:02"}
+      {
+        "name": "bond0",
+        "mac": "52:54:00:01:01:01"
+      },
+      {
+        "name": "eno1",
+        "mac": "52:54:00:01:01:01"
+      },
+      {
+        "name": "eno2",
+        "mac": "52:54:00:01:01:02"
+      }
     ]
   },
   "bond_validator": {
@@ -22,8 +32,16 @@
         "bond_mode": "fail",
         "bond_cabling": "unknown",
         "members": [
-          {"interface": "eno1", "lacp_advertised": false, "pdus": []},
-          {"interface": "eno2", "lacp_advertised": false, "pdus": []}
+          {
+            "interface": "eno1",
+            "lacp_advertised": false,
+            "pdus": []
+          },
+          {
+            "interface": "eno2",
+            "lacp_advertised": false,
+            "pdus": []
+          }
         ]
       }
     ],
@@ -37,7 +55,10 @@
           "bond": "bond0",
           "configured_mode": "802.3ad",
           "lacp_advertised": false,
-          "interfaces": ["eno1", "eno2"]
+          "interfaces": [
+            "eno1",
+            "eno2"
+          ]
         }
       }
     ]
@@ -98,9 +119,21 @@
           }
         },
         "traceroute_hops": [
-          {"hop": 1, "ip": "10.20.1.1", "rtt_ms": 0.4},
-          {"hop": 2, "ip": null, "rtt_ms": null},
-          {"hop": 3, "ip": null, "rtt_ms": null}
+          {
+            "hop": 1,
+            "ip": "10.20.1.1",
+            "rtt_ms": 0.4
+          },
+          {
+            "hop": 2,
+            "ip": null,
+            "rtt_ms": null
+          },
+          {
+            "hop": 3,
+            "ip": null,
+            "rtt_ms": null
+          }
         ]
       }
     ],

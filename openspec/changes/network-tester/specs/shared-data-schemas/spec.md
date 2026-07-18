@@ -22,6 +22,13 @@ The schemas SHALL define a common finding envelope that every validator finding 
 - **WHEN** any validator emits a finding into probe output
 - **THEN** schema validation SHALL verify the envelope fields are present and `classification` and `scope` use the enumerated values
 
+### Requirement: Stamp probe output with the triggering run-id
+The probe-output document SHALL carry a `probe_run_id` string field stamped by the probe-runner from the charm-provided run-id, so the CLI collector can reject documents left over from an earlier run (`stale-probe-output` in `missing_nodes`). The field is additive: schema validation SHALL accept documents without it (they predate this field), but the payload always writes it.
+
+#### Scenario: Collector rejects a stale document
+- **WHEN** a collected probe-output's `probe_run_id` differs from the run-id the CLI just triggered
+- **THEN** the CLI SHALL exclude that document from the report and record the node in `missing_nodes` with reason `stale-probe-output`
+
 ### Requirement: Define per-validator execution status and cross-rack path observations
 The probe-output schema SHALL require every validator section (`bond_validator`, `vlan_neighbor_validator`, `mtu_validator`, `bgp_inference`) to include a `validator_status` value from `complete`, `skipped`, `not_started`, `timeout`, or `cancelled`, plus optional `skip_reason` or `timeout_reason` fields when applicable. Absence of a failure finding SHALL NOT be used to infer that a validator completed successfully. The cross-rack validators (`mtu_validator`, `bgp_inference`) SHALL additionally emit a structured per-path observation for each expected rack-pair item they derive, with an `observation_status` value from `success`, `failure`, `inconclusive`, `timeout`, or `cancelled`, so the report-generator can distinguish healthy paths from unattempted paths. Phase-1 validators (`bond_validator`, `vlan_neighbor_validator`) carry `validator_status` plus their existing findings and skipped-observation structures; no per-path records are required of them.
 

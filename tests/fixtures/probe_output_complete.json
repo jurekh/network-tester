@@ -1,5 +1,6 @@
 {
   "schema_version": "1",
+  "probe_run_id": "20260712-000000",
   "status": "complete",
   "node": {
     "system_id": "aaa001",
@@ -7,9 +8,18 @@
     "rack": "rack-1",
     "role": "data",
     "interfaces": [
-      {"name": "bond0", "mac": "52:54:00:01:01:01"},
-      {"name": "eno1", "mac": "52:54:00:01:01:01"},
-      {"name": "eno2", "mac": "52:54:00:01:01:02"}
+      {
+        "name": "bond0",
+        "mac": "52:54:00:01:01:01"
+      },
+      {
+        "name": "eno1",
+        "mac": "52:54:00:01:01:01"
+      },
+      {
+        "name": "eno2",
+        "mac": "52:54:00:01:01:02"
+      }
     ]
   },
   "bond_validator": {
@@ -29,10 +39,18 @@
               {
                 "actor_system_id": "aa:bb:cc:dd:ee:01",
                 "actor_port_key": 17,
-                "actor_state": {"active": true, "aggregatable": true, "in_sync": true},
+                "actor_state": {
+                  "active": true,
+                  "aggregatable": true,
+                  "in_sync": true
+                },
                 "partner_system_id": "52:54:00:01:01:01",
                 "partner_port_key": 9,
-                "partner_state": {"active": true, "aggregatable": true, "in_sync": true}
+                "partner_state": {
+                  "active": true,
+                  "aggregatable": true,
+                  "in_sync": true
+                }
               }
             ]
           },
@@ -43,10 +61,18 @@
               {
                 "actor_system_id": "aa:bb:cc:dd:ee:01",
                 "actor_port_key": 18,
-                "actor_state": {"active": true, "aggregatable": true, "in_sync": true},
+                "actor_state": {
+                  "active": true,
+                  "aggregatable": true,
+                  "in_sync": true
+                },
                 "partner_system_id": "52:54:00:01:01:01",
                 "partner_port_key": 10,
-                "partner_state": {"active": true, "aggregatable": true, "in_sync": true}
+                "partner_state": {
+                  "active": true,
+                  "aggregatable": true,
+                  "in_sync": true
+                }
               }
             ]
           }
@@ -67,7 +93,11 @@
         "peer_mac": "52:54:00:01:02:01",
         "arp_observed": true,
         "icmp_reachable": true,
-        "rtt_ms": {"min": 0.21, "avg": 0.33, "max": 0.49},
+        "rtt_ms": {
+          "min": 0.21,
+          "avg": 0.33,
+          "max": 0.49
+        },
         "loss_pct": 0
       }
     ]

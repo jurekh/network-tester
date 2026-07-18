@@ -57,18 +57,31 @@ config:
     probe-run-id:
       description: |
         Unique identifier for a probe run (set by the CLI, e.g. YYYYMMDD-HHMMSS).
-        When the leader sees a non-empty value it propagates it to peer relation
-        data; units run the probe payload when the relation value differs from
-        their last executed run-id. Empty means no probe run is requested.
+        Every unit runs the probe payload from its own config-changed hook when
+        the value differs from its last executed run-id; the leader also writes
+        the value to peer relation data as a catch-up trigger. Empty means no
+        probe run is requested.
       default: ""
       type: string
     probe-timeout:
       description: |
         Overall probe payload timeout in seconds. Must stay below the Juju hook
         timeout (300s default) with margin for the payload's 5-second partial
-        result flush window.
+        result flush window and any probe-start-at rendezvous wait (the payload
+        clamps that wait to 45 seconds).
       default: 240
       type: int
+    probe-start-at:
+      description: |
+        Epoch-seconds instant at which the probe payload should start (set by
+        the CLI together with probe-run-id). Units sleep until this instant
+        before probing so their capture windows align regardless of hook
+        dispatch skew; nodes share MAAS NTP, so the instant is common-mode.
+        Empty or 0 means start immediately. The payload clamps the wait to
+        45 seconds so a skewed workstation clock cannot push the hook past
+        its timeout budget.
+      default: ""
+      type: string
 
 actions:
   collect-results:

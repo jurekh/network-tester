@@ -114,12 +114,14 @@ def test_start_sets_active_ready():
 # --- probe-run-id propagation and payload invocation (4.13, 4.14, 4.17) ---------
 
 
-def assert_payload_invoked(run_mock, expected_timeout="240"):
+def assert_payload_invoked(run_mock, expected_timeout="240", expected_start_at="0"):
     cmd = run_mock.call_args[0][0]
     assert cmd[0] == sys.executable
     assert cmd[1].endswith("payload/probe.py")
     assert cmd[2].endswith("topology.json")
     assert cmd[3] == expected_timeout
+    assert cmd[4] == RUN_ID
+    assert cmd[5] == expected_start_at
 
 
 def test_leader_config_changed_propagates_run_id_and_probes(paths, monkeypatch):
@@ -176,6 +178,25 @@ def test_non_leader_config_changed_probes_without_writing_relation_data(paths):
     assert "probe-run-id" not in state_out.get_relation(relation.id).local_app_data
     assert_payload_invoked(run)
     assert (paths / "last-probe-run-id").read_text() == RUN_ID
+
+
+def test_probe_start_at_config_forwarded_to_payload(paths):
+    relation = testing.PeerRelation("network-tester-peers")
+    ctx = make_context()
+    with patch("charm.subprocess.run") as run:
+        ctx.run(
+            ctx.on.config_changed(),
+            testing.State(
+                leader=False,
+                config={
+                    "probe-run-id": RUN_ID,
+                    "probe-timeout": 240,
+                    "probe-start-at": "1783790000",
+                },
+                relations={relation},
+            ),
+        )
+    assert_payload_invoked(run, expected_start_at="1783790000")
 
 
 def test_peer_relation_changed_runs_payload_for_new_run_id(paths):

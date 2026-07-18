@@ -105,21 +105,32 @@ def _probe_complete(run_id):
 
 
 async def _trigger_and_collect(
-    facade, model_name, unit_machines, wait_deadline, missing, poll, probe_timeout=None
+    facade,
+    model_name,
+    unit_machines,
+    wait_deadline,
+    missing,
+    poll,
+    probe_timeout=None,
+    probe_start_delay=0,
 ):
     """Set a fresh probe-run-id, wait for completion, collect results.
 
     unit_machines: {unit_name: machine record} for units eligible to probe.
     When probe_timeout is set it is applied in the same config change as the
     run-id so the triggered run uses it (the charm reads probe-timeout when it
-    launches the payload). Returns {unit_name: probe output document}; appends
-    to missing.
+    launches the payload). When probe_start_delay is positive, probe-start-at
+    is set to now+delay so all units open their capture windows at the same
+    instant regardless of hook dispatch skew. Returns {unit_name: probe output
+    document}; appends to missing.
     """
     run_id = timestamp()
     log(f"triggering probe run {run_id} on {len(unit_machines)} unit(s)")
     config = {"probe-run-id": run_id}
     if probe_timeout is not None:
         config["probe-timeout"] = str(probe_timeout)
+    if probe_start_delay:
+        config["probe-start-at"] = str(int(time.time()) + probe_start_delay)
     await facade.set_config(model_name, config)
 
     done, stragglers = await wait_for_units(
@@ -152,13 +163,34 @@ async def _trigger_and_collect(
                 )
             )
             continue
-        collected[unit] = json.loads(result["probe-output"])
+        doc = json.loads(result["probe-output"])
+        # Cross-check the document against the run just triggered: the unit
+        # status message is the primary freshness gate, but a lingering file
+        # from an earlier run must never be aggregated as current results.
+        if doc.get("probe_run_id") != run_id:
+            missing.append(
+                missing_entry(
+                    unit_machines[unit],
+                    "stale-probe-output",
+                    f"unit {unit} returned output for run "
+                    f"'{doc.get('probe_run_id')}' (expected {run_id})",
+                )
+            )
+            continue
+        collected[unit] = doc
     log(f"raw per-unit results saved under {raw_dir}")
     return collected
 
 
 async def run_new(
-    facade, topology, charm_path, wait_timeout, cloud=None, poll=10, probe_timeout=None
+    facade,
+    topology,
+    charm_path,
+    wait_timeout,
+    cloud=None,
+    poll=10,
+    probe_timeout=None,
+    probe_start_delay=0,
 ):
     """Deploy, trigger, and collect a new probe run.
 
@@ -217,11 +249,14 @@ async def run_new(
             missing,
             poll,
             probe_timeout=probe_timeout,
+            probe_start_delay=probe_start_delay,
         )
     return model_name, collected, missing
 
 
-async def run_reuse(facade, model_name, wait_timeout, poll=10, probe_timeout=None):
+async def run_reuse(
+    facade, model_name, wait_timeout, poll=10, probe_timeout=None, probe_start_delay=0
+):
     """Re-trigger probing on an existing model and collect results.
 
     Returns (topology, collected outputs by unit, missing entries, warnings).
@@ -271,6 +306,7 @@ async def run_reuse(facade, model_name, wait_timeout, poll=10, probe_timeout=Non
         missing,
         poll,
         probe_timeout=probe_timeout,
+        probe_start_delay=probe_start_delay,
     )
     return topology, collected, missing, warnings
 

@@ -1,5 +1,6 @@
 {
   "schema_version": "1",
+  "probe_run_id": "20260712-000000",
   "status": "complete",
   "node": {
     "system_id": "aaa002",
@@ -7,7 +8,10 @@
     "rack": "rack-1",
     "role": "data",
     "interfaces": [
-      {"name": "eth0", "mac": "52:54:00:01:02:01"}
+      {
+        "name": "eth0",
+        "mac": "52:54:00:01:02:01"
+      }
     ]
   },
   "bond_validator": {

@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import json
+import os
 import signal
 import sys
 from pathlib import Path
@@ -63,20 +64,34 @@ def build_parser():
     )
     run.add_argument("--maas-url", metavar="URL", help="MAAS API URL, e.g. http://maas:5240/MAAS")
     run.add_argument(
-        "--maas-key", metavar="KEY", help="MAAS API key (<consumer>:<token>:<secret>)"
+        "--maas-key",
+        metavar="KEY",
+        help="MAAS API key (<consumer>:<token>:<secret>); prefer the "
+        "MAAS_API_KEY environment variable, which does not leak via ps or "
+        "shell history",
     )
     run.add_argument(
         "--wait-timeout",
         type=int,
-        default=600,
+        default=1800,
         metavar="SECONDS",
-        help="how long to wait for units (default: 600)",
+        help="how long to wait for units; bare-metal deployment routinely "
+        "takes 15-25 minutes (default: 1800)",
     )
     run.add_argument(
         "--probe-timeout",
         type=int,
         metavar="SECONDS",
         help="override the charm probe-timeout for this run (default: charm config, 240)",
+    )
+    run.add_argument(
+        "--probe-start-delay",
+        type=int,
+        default=30,
+        metavar="SECONDS",
+        help="rendezvous delay: units start probing at now+DELAY so capture "
+        "windows align across nodes regardless of hook dispatch skew "
+        "(default: 30; 0 starts each unit immediately)",
     )
     run.add_argument(
         "--verbose",
@@ -243,6 +258,7 @@ async def _deploy_and_report(facade, args, topology, model_holder):
         args.wait_timeout,
         cloud=args.cloud,
         probe_timeout=args.probe_timeout,
+        probe_start_delay=args.probe_start_delay,
     )
     model_holder["model"] = model_name
     report = _finish_run(
@@ -269,7 +285,11 @@ async def _deploy_and_report(facade, args, topology, model_holder):
 async def _reuse_and_report(facade, args, model_holder):
     model_holder["model"] = args.reuse_model
     topology, collected, missing, _warnings = await juju_run.run_reuse(
-        facade, args.reuse_model, args.wait_timeout, probe_timeout=args.probe_timeout
+        facade,
+        args.reuse_model,
+        args.wait_timeout,
+        probe_timeout=args.probe_timeout,
+        probe_start_delay=args.probe_start_delay,
     )
     report = _finish_run(
         collected,
@@ -294,21 +314,42 @@ async def _with_facade(coro_func, *args):
         await facade.disconnect()
 
 
+def _report_run_failure(exc, model_holder):
+    """Print an operator-readable failure and the model-release hint.
+
+    Non-JujuError exceptions (libjuju internals, malformed probe output,
+    report generation) must not surface as raw tracebacks that skip the
+    model cleanup guidance.
+    """
+    label = str(exc) if isinstance(exc, juju_run.JujuError) else f"{type(exc).__name__}: {exc}"
+    print(f"error: {label}", file=sys.stderr)
+    name = model_holder.get("model")
+    if name:
+        print(
+            f"Model {name} may hold nodes; run `juju destroy-model {name}` to release them",
+            file=sys.stderr,
+        )
+    return 1
+
+
 def cmd_run(args):
     error = _validate_targeting(args)
     if error:
         print(f"error: {error}", file=sys.stderr)
         return 2
+    args.maas_key = args.maas_key or os.environ.get("MAAS_API_KEY")
     model_holder = {}
     if args.reuse_model:
         _install_sigint_handler(model_holder)
         try:
             return asyncio.run(_with_facade(_reuse_and_report, args, model_holder))
-        except juju_run.JujuError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 1
+        except Exception as exc:  # noqa: BLE001 - operator-facing CLI boundary
+            return _report_run_failure(exc, model_holder)
     if not args.maas_url or not args.maas_key:
-        print("error: --maas-url and --maas-key are required", file=sys.stderr)
+        print(
+            "error: --maas-url and --maas-key (or MAAS_API_KEY) are required",
+            file=sys.stderr,
+        )
         return 2
 
     mode, scope_args = _scope(args)
@@ -343,15 +384,8 @@ def cmd_run(args):
     _install_sigint_handler(model_holder)
     try:
         return asyncio.run(_with_facade(_deploy_and_report, args, topology, model_holder))
-    except juju_run.JujuError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        name = model_holder.get("model")
-        if name:
-            print(
-                f"Model {name} may hold nodes; run `juju destroy-model {name}` to release them",
-                file=sys.stderr,
-            )
-        return 1
+    except Exception as exc:  # noqa: BLE001 - operator-facing CLI boundary
+        return _report_run_failure(exc, model_holder)
 
 
 async def _status(facade, model_arg):

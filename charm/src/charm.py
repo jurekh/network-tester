@@ -105,8 +105,10 @@ class NetworkTesterCharm(ops.CharmBase):
         self.unit.status = ops.MaintenanceStatus(f"running probe {run_id}")
         probe = self.charm_dir / "payload" / "probe.py"
         timeout = int(self.config["probe-timeout"])
+        start_at = str(self.config["probe-start-at"]) or "0"
         subprocess.run(
-            [sys.executable, str(probe), str(TOPOLOGY_PATH), str(timeout)], check=True
+            [sys.executable, str(probe), str(TOPOLOGY_PATH), str(timeout), run_id, start_at],
+            check=True,
         )
         LAST_RUN_PATH.parent.mkdir(parents=True, exist_ok=True)
         LAST_RUN_PATH.write_text(run_id)

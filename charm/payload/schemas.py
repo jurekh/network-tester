@@ -12,9 +12,10 @@ Validation is stdlib-only because this module ships inside the charm payload.
 Validators return a list of error strings; an empty list means the document
 is valid.
 
-This file is duplicated at ``cli/schemas.py`` because the charm payload
-cannot import an installed package on nodes. Tests assert the copies are
-byte-identical; edit both together.
+This module is maintained at ``cli/schemas.py`` (canonical) with a
+byte-identical copy at ``charm/payload/schemas.py``, because the charm payload
+cannot import an installed package on nodes. Edit the cli copy and run
+``make sync-shared``; tests assert the copies stay byte-identical.
 """
 
 SCHEMA_VERSION = "1"
@@ -32,7 +33,13 @@ FINDING_SCOPES = frozenset({"interface", "node", "rack-pair"})
 TARGET_ROLES = frozenset({"representative", "fallback"})
 
 MISSING_NODE_REASONS = frozenset(
-    {"placement-failed", "deployment-timeout", "probe-timeout", "no-probe-output"}
+    {
+        "placement-failed",
+        "deployment-timeout",
+        "probe-timeout",
+        "no-probe-output",
+        "stale-probe-output",
+    }
 )
 
 RULE_L2 = "l2-same-fabric-vlan"
@@ -275,6 +282,9 @@ def validate_probe_output(doc):
         return ["probe_output: expected an object"]
     ctx = "probe_output"
     _check_schema_version(doc, errors, ctx)
+    # Additive since the collector's stale-output cross-check: the payload
+    # always writes it; optional here so older documents stay valid.
+    _check(doc, "probe_run_id", str, errors, ctx, required=False)
     _check_enum(doc, "status", PROBE_STATUSES, errors, ctx)
 
     node = _check(doc, "node", dict, errors, ctx)

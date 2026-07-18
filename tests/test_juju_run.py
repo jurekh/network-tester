@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 
 import pytest
 from conftest import FIXTURES, load_fixture
@@ -31,6 +32,7 @@ class FakeFacade:
         fail_placement=(),
         stuck_units=(),
         missing_output_units=(),
+        stale_output_units=(),
         unit_files=None,
         existing_units=None,
     ):
@@ -38,6 +40,7 @@ class FakeFacade:
         self.fail_placement = set(fail_placement)
         self.stuck_units = set(stuck_units)
         self.missing_output_units = set(missing_output_units)
+        self.stale_output_units = set(stale_output_units)
         self.unit_files = unit_files or {}
         self.added_units = []  # (model, placement)
         self.config_calls = []
@@ -100,7 +103,12 @@ class FakeFacade:
         machine = self._machines_by_hostname.get(
             hostname, {"system_id": "x", "hostname": hostname}
         )
-        return {"probe-output": json.dumps(probe_output_for(machine))}
+        doc = probe_output_for(machine)
+        # the charm stamps the triggered run-id into the payload output
+        doc["probe_run_id"] = (
+            "19990101-000000" if unit in self.stale_output_units else self._run_id
+        )
+        return {"probe-output": json.dumps(doc)}
 
     async def cat_file(self, name, unit, path):
         key = (unit, path)
@@ -212,6 +220,33 @@ def test_missing_probe_output_recorded():
     _, collected, missing = run(run_new(facade, TOPOLOGY, "nt.charm", 60, poll=0))
     assert [(m["hostname"], m["reason"]) for m in missing] == [("r1-data-02", "no-probe-output")]
     assert len(collected) == 3
+
+
+def test_stale_probe_output_recorded_not_aggregated():
+    """A unit whose collected output carries a different run-id than the one
+    just triggered must not contribute results (the status-message gate is
+    the primary freshness guard; this is the cross-check on the document)."""
+    facade = FakeFacade(stale_output_units={"network-tester/1"})
+    _, collected, missing = run(run_new(facade, TOPOLOGY, "nt.charm", 60, poll=0))
+    assert [(m["hostname"], m["reason"]) for m in missing] == [
+        ("r1-data-02", "stale-probe-output")
+    ]
+    assert len(collected) == 3
+
+
+def test_probe_start_at_set_with_run_id_when_delay_given():
+    facade = FakeFacade()
+    before = int(time.time())
+    run(run_new(facade, TOPOLOGY, "nt.charm", 60, poll=0, probe_start_delay=30))
+    _, values = facade.config_calls[0]
+    assert int(values["probe-start-at"]) >= before + 30
+
+
+def test_probe_start_at_omitted_when_delay_zero():
+    facade = FakeFacade()
+    run(run_new(facade, TOPOLOGY, "nt.charm", 60, poll=0, probe_start_delay=0))
+    _, values = facade.config_calls[0]
+    assert "probe-start-at" not in values
 
 
 # --- reuse mode (4.28) -------------------------------------------------------------

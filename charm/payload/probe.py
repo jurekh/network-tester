@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Probe payload entry point.
 
-Invoked by the charm as ``probe.py <topology-json-path> <probe-timeout-seconds>``.
-Loads the topology, resolves node identity by MAC matching, runs the
-validators via the probe runner, and writes
-/var/log/network-tester/probe-output.json.
+Invoked by the charm as ``probe.py <topology-json-path> <probe-timeout-seconds>
+[<probe-run-id> [<start-at-epoch>]]``. Loads the topology, resolves node
+identity by MAC matching, optionally waits for the shared start instant so
+capture windows align across units, runs the validators via the probe runner,
+and writes /var/log/network-tester/probe-output.json stamped with the run-id.
 
 Stdlib only: this script runs on MAAS ephemeral nodes with no third-party
 packages installed.
@@ -13,6 +14,7 @@ packages installed.
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -23,6 +25,25 @@ import json
 
 import probe_runner
 import schemas
+
+# Upper bound on the rendezvous wait: the CLI computes start-at from the
+# operator workstation's clock, and a skewed workstation must not push the
+# hook past its timeout budget (wait + probe-timeout 240 + 5s flush must stay
+# below the 300s hook timeout). The nodes themselves share MAAS NTP, so a
+# legitimate wait stays common-mode across units; only a skewed or
+# over-configured start-at gets clamped.
+MAX_START_DELAY_SECONDS = 45
+
+
+def _wait_for_start(raw_start_at):
+    """Sleep until the shared start instant; no-op when unset or in the past."""
+    try:
+        start_at = float(raw_start_at)
+    except (TypeError, ValueError):
+        return
+    delay = min(max(start_at - time.time(), 0), MAX_START_DELAY_SECONDS)
+    if delay > 0:
+        time.sleep(delay)
 
 
 def local_macs():
@@ -52,9 +73,15 @@ def find_node(topology, macs):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if len(argv) != 2:
-        print("usage: probe.py <topology-json-path> <probe-timeout-seconds>", file=sys.stderr)
+    if not 2 <= len(argv) <= 4:
+        print(
+            "usage: probe.py <topology-json-path> <probe-timeout-seconds> "
+            "[<probe-run-id> [<start-at-epoch>]]",
+            file=sys.stderr,
+        )
         return 2
+    run_id = argv[2] if len(argv) > 2 else ""
+    start_at = argv[3] if len(argv) > 3 else ""
     topology_path = Path(argv[0])
     try:
         timeout = int(argv[1])
@@ -86,7 +113,8 @@ def main(argv=None):
         )
         return 2
 
-    status = probe_runner.run_probe(topology, node, timeout)
+    _wait_for_start(start_at)
+    status = probe_runner.run_probe(topology, node, timeout, run_id=run_id)
     print(f"probe finished with status {status}")
     return 0
 

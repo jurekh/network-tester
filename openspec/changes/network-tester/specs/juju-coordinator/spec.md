@@ -73,12 +73,12 @@ If a unit's probe output file does not exist when `collect-results` is invoked, 
 - **WHEN** the `collect-results` action is run on a unit that did not complete probing
 - **THEN** the action result SHALL contain `{"status": "missing", "unit": "<unit-name>"}` and exit without error
 
-### Requirement: Invoke probe payload with topology path and probe-timeout after new probe-run-id is observed
-When a unit's `peer-relation-changed` hook fires with a new `probe-run-id` in relation data, the unit SHALL invoke the probe payload from the installed charm source path (`payload/probe.py`) passing the topology JSON path and the `probe-timeout` config value (default: 240 seconds; this default MUST stay below the Juju hook timeout of 300 seconds with margin for the payload's 5-second flush window, since the hook waits for the payload synchronously). The payload is packaged with the charm source, not fetched as a Juju resource. The unit SHALL wait for the payload to exit before the hook completes, then write the run-id to `/var/lib/network-tester/last-probe-run-id`.
+### Requirement: Invoke probe payload with topology path, probe-timeout, run-id, and start instant after new probe-run-id is observed
+When a unit observes a new `probe-run-id` (via its own `config-changed` hook or the `peer-relation-changed` catch-up path), the unit SHALL invoke the probe payload from the installed charm source path (`payload/probe.py`) passing the topology JSON path, the `probe-timeout` config value, the run-id, and the `probe-start-at` config value (`0` when unset). The probe-timeout default is 240 seconds and MUST stay below the Juju hook timeout of 300 seconds with margin for the payload's 5-second flush window and the rendezvous wait (clamped to 45 seconds by the payload), since the hook waits for the payload synchronously. The payload is packaged with the charm source, not fetched as a Juju resource. The unit SHALL wait for the payload to exit before the hook completes, then write the run-id to `/var/lib/network-tester/last-probe-run-id`.
 
 #### Scenario: Payload invoked with correct arguments
-- **WHEN** a new `probe-run-id` is observed in peer relation data
-- **THEN** the unit SHALL invoke the installed charm source `payload/probe.py <topology-path> <probe-timeout>` and wait for it to exit
+- **WHEN** a new `probe-run-id` is observed
+- **THEN** the unit SHALL invoke the installed charm source `payload/probe.py <topology-path> <probe-timeout> <probe-run-id> <probe-start-at>` and wait for it to exit
 
 #### Scenario: Payload exits with timeout or cancelled status
 - **WHEN** the payload writes probe-output.json with `"status": "timeout"` or `"status": "cancelled"` and exits 0

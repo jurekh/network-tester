@@ -156,6 +156,44 @@ def test_full_probe_run_writes_schema_valid_output(monkeypatch, tmp_path, capsys
     assert "status complete" in capsys.readouterr().out
 
 
+def test_run_id_argument_recorded_in_output(monkeypatch, tmp_path, fake_tools):
+    import bgp_inference
+    import mtu_validator
+
+    output = tmp_path / "var" / "log" / "probe-output.json"
+    monkeypatch.setattr(probe_runner, "OUTPUT_PATH", output)
+    monkeypatch.setattr(probe, "local_macs", lambda: {"52:54:00:01:01:01"})
+    fake_tools["arp"]["10.20.1.12"] = True
+    fake_tools["ping3"]["10.20.1.12"] = PING_OK
+    monkeypatch.setattr(mtu_validator, "_ping_df", lambda ip, size, c: (True, None))
+    monkeypatch.setattr(bgp_inference, "_icmp_ok", lambda ip, c: True)
+
+    assert probe.main([str(TOPOLOGY), "30", "20260712-120000", "0"]) == 0
+    doc = json.loads(output.read_text())
+    assert doc["probe_run_id"] == "20260712-120000"
+    assert schemas.validate_probe_output(doc) == []
+
+
+def test_start_at_rendezvous_sleep_is_clamped(monkeypatch):
+    """The payload sleeps until the shared start instant so capture windows
+    align across units, but a skewed workstation clock must not stall the
+    hook: the wait is clamped."""
+    sleeps = []
+    monkeypatch.setattr(probe.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(probe.time, "time", lambda: 1000.0)
+    probe._wait_for_start("1030")
+    assert sleeps == [30.0]
+    sleeps.clear()
+    probe._wait_for_start(str(1000 + 10 * probe.MAX_START_DELAY_SECONDS))
+    assert sleeps == [probe.MAX_START_DELAY_SECONDS]
+    sleeps.clear()
+    probe._wait_for_start("900")  # already past: no wait
+    probe._wait_for_start("0")  # unset: no wait
+    probe._wait_for_start("")  # absent: no wait
+    probe._wait_for_start("bogus")  # unparsable: no wait
+    assert sleeps == []
+
+
 def test_phase_one_runs_concurrently_before_phase_two(tmp_path):
     """bond and vlan overlap; mtu starts only after both finish; bgp after mtu."""
     events = []

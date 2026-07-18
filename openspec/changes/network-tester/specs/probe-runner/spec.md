@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
-### Requirement: Accept topology JSON path and probe-timeout as arguments
-The probe-runner SHALL accept two arguments at invocation: the path to the topology JSON file and the probe timeout in seconds (both provided by the charm). If either argument is missing or the topology file is not readable, the probe-runner SHALL exit non-zero with a clear error before probing begins.
+### Requirement: Accept topology path, probe-timeout, run-id, and start instant as arguments
+The probe-runner SHALL accept two required arguments at invocation -- the path to the topology JSON file and the probe timeout in seconds -- plus two optional arguments: the probe run-id and an epoch-seconds start instant (all provided by the charm). If a required argument is missing or the topology file is not readable, the probe-runner SHALL exit non-zero with a clear error before probing begins. The run-id SHALL be stamped into the probe output as `probe_run_id` so the collector can reject stale documents. When the start instant is set and in the future, the probe-runner SHALL wait until that instant before starting validators, clamping the wait to 45 seconds (nodes share MAAS NTP, so the instant is common-mode across units and aligns their capture windows; the clamp protects the charm hook from a skewed workstation clock). The probe timeout budget starts after the wait.
 
 #### Scenario: Valid invocation
 - **WHEN** invoked with a readable topology JSON path and a positive integer timeout
@@ -10,6 +10,14 @@ The probe-runner SHALL accept two arguments at invocation: the path to the topol
 #### Scenario: Topology file missing
 - **WHEN** invoked with a topology path that does not exist
 - **THEN** the probe-runner SHALL exit non-zero with: "Topology file not found at <path>; charm install hook must write it before invoking the payload"
+
+#### Scenario: Future start instant
+- **WHEN** invoked with a start instant N seconds in the future (N <= 45)
+- **THEN** the probe-runner SHALL wait ~N seconds before starting validators and then run with the full probe-timeout budget
+
+#### Scenario: Start instant absent, past, or unparsable
+- **WHEN** the start instant argument is missing, empty, `0`, in the past, or not a number
+- **THEN** the probe-runner SHALL start validators immediately
 
 ### Requirement: Resolve node identity from topology via MAC matching before probing
 Before invoking any validator, the probe-runner SHALL read interface MAC addresses from `ip link show` and match them against the topology JSON to find this node's machine record. If no match is found, the probe-runner SHALL exit non-zero with the list of observed MACs.

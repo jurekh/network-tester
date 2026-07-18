@@ -37,8 +37,22 @@ def test_reuse_model_conflicts_with_targeting(capsys, monkeypatch):
 
 
 def test_run_requires_maas_credentials(capsys, monkeypatch):
+    monkeypatch.delenv("MAAS_API_KEY", raising=False)
     assert run_cli(["run", "--all"], monkeypatch) == 2
-    assert "--maas-url and --maas-key are required" in capsys.readouterr().err
+    assert "--maas-key (or MAAS_API_KEY)" in capsys.readouterr().err
+
+
+def test_maas_key_falls_back_to_environment(capsys, monkeypatch):
+    """The API key is a secret: argv leaks via ps and shell history, so the
+    environment must be an accepted source."""
+    monkeypatch.setenv("MAAS_API_KEY", "a:b:c")
+    code = run_cli(
+        ["run", "--dry-run", "--all", "--maas-url", "http://maas:5240/MAAS"],
+        monkeypatch,
+        machines=[data_machine("aaa001", "data-01")],
+    )
+    assert code == 0
+    assert "Pre-flight validation passed" in capsys.readouterr().out
 
 
 def test_run_accepts_all_documented_flags(monkeypatch, tmp_path):
@@ -187,9 +201,18 @@ def deploy_cli(argv, monkeypatch, tmp_path, keep=False):
     monkeypatch.setattr(cli_main.juju_run, "LibjujuFacade", RecordingFacade)
 
     async def fake_run_new(
-        facade, topology, charm_path, wait_timeout, cloud=None, poll=10, probe_timeout=None
+        facade,
+        topology,
+        charm_path,
+        wait_timeout,
+        cloud=None,
+        poll=10,
+        probe_timeout=None,
+        probe_start_delay=0,
     ):
-        fake_run_new.calls.append((charm_path, wait_timeout, cloud, probe_timeout))
+        fake_run_new.calls.append(
+            (charm_path, wait_timeout, cloud, probe_timeout, probe_start_delay)
+        )
         return "network-test-fake", {}, []
 
     fake_run_new.calls = []
@@ -206,7 +229,7 @@ def test_run_deploys_reports_and_destroys_model(capsys, monkeypatch, tmp_path):
         tmp_path,
     )
     assert code == 0
-    assert calls == [("nt.charm", 600, "maas-x", None)]
+    assert calls == [("nt.charm", 1800, "maas-x", None, 30)]
     facade = RecordingFacade.instances[0]
     assert facade.destroyed == ["network-test-fake"]
     assert facade.list_models_calls > 0  # waited for destruction to complete
@@ -224,6 +247,39 @@ def test_run_threads_probe_timeout_to_run_new(monkeypatch, tmp_path):
     )
     assert code == 0
     assert calls[0][3] == 30
+
+
+def test_run_threads_probe_start_delay_to_run_new(monkeypatch, tmp_path):
+    code, calls = deploy_cli(
+        ["run", "--all", "--charm", "nt.charm", "--probe-start-delay", "0", *MAAS_ARGS],
+        monkeypatch,
+        tmp_path,
+    )
+    assert code == 0
+    assert calls[0][4] == 0
+
+
+def test_unexpected_exception_reports_error_and_model_hint(capsys, monkeypatch, tmp_path):
+    """Failures other than JujuError (libjuju internals, malformed probe
+    output) must exit 1 with the model-release hint, not a raw traceback."""
+    RecordingFacade.instances = []
+    monkeypatch.setattr(cli_main.juju_run, "LibjujuFacade", RecordingFacade)
+
+    async def exploding_run_new(facade, topology, charm_path, wait_timeout, **kwargs):
+        cli_main.juju_run.log("creating model network-test-boom")
+        raise RuntimeError("connection reset by libjuju")
+
+    monkeypatch.setattr(cli_main.juju_run, "run_new", exploding_run_new)
+    monkeypatch.chdir(tmp_path)
+    code = run_cli(
+        ["run", "--all", "--charm", "nt.charm", *MAAS_ARGS],
+        monkeypatch,
+        machines=[data_machine("aaa001", "data-01")],
+    )
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "RuntimeError" in err
+    assert "connection reset by libjuju" in err
 
 
 def test_run_keep_model_skips_destroy(capsys, monkeypatch, tmp_path):
