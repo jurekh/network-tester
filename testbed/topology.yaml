@@ -7,16 +7,26 @@ vm:
   name: nt-testbed
   image: ubuntu:24.04
   cpu: 8
-  memory: 16GiB
+  memory: 20GiB
   disk: 100GiB
-  # Reduced profile guidance for smaller hosts is in README.md; lower these
-  # values here if needed (MAAS + 2 nodes fits in 4 CPU / 12GiB).
+  # Multi-rack (stage 7) raises this from the single-rack 16GiB. The stage-7
+  # design profile is 24GiB; 20GiB is the reduced profile used here (rack 2 has
+  # a single data node). Lower further on smaller hosts per README.md.
 
-# Management/PXE network, served by MAAS DHCP inside the testbed VM. Nodes
-# only commission here on first compose; their NICs are then retagged onto
-# the VLANs below. The untagged segment keeps the MAAS region, inner LXD API,
-# and the Juju controller container, whose ARP traffic must not appear on the
-# segments the vlan-neighbor-validator captures on.
+maas:
+  # Snap channel for the maas snap; maas-test-db follows the same channel.
+  # Changing this on an existing testbed requires `nt-testbed down && up`.
+  channel: 3.7/stable
+  admin_user: admin
+  admin_password: testbed
+  admin_email: admin@nt-testbed.local
+  vm_host_name: rack1-lxd
+
+# Management/PXE network for rack 1, served by MAAS DHCP inside the testbed VM.
+# Nodes only commission on the untagged segment; their NICs are then retagged
+# onto the VLANs below. The untagged segment keeps the MAAS region, inner LXD
+# API, and the Juju controller container, whose ARP traffic must not appear on
+# the segments the vlan-neighbor-validator captures on.
 pxe:
   bridge: br-rack1
   cidr: 10.100.1.0/24
@@ -27,13 +37,9 @@ pxe:
 # ports. `management: true` VLANs get a rack-controller presence: a Linux
 # 802.1q subinterface (br-rack1.<tag>) on the bridge LOCAL port (an OVS
 # trunk), which MAAS discovers natively as a vid-tagged VLAN interface and
-# serves DHCP on (MAAS cannot see OVS-internal-port tags, so a plain OVS
-# internal port does not work). Each management VLAN is its own fabric, so
-# the topology fetcher classifies it management. The data VLAN has no
-# controller presence: it is L2-only between nodes and is modeled as its own
-# data fabric. The Juju controller stays on the untagged PXE segment and
-# reaches node agents by L3 routing through the testbed VM, so its MAC never
-# appears on these probed VLANs.
+# serves DHCP on. Each management VLAN is its own fabric. The data VLAN has a
+# gateway only since stage 7: the rack-1 ToR router (FRR) owns gateway_ip so
+# cross-rack traffic routes; same-rack L2 neighbor checks are unaffected.
 vlans:
   mgmt:
     tag: 30
@@ -53,26 +59,52 @@ vlans:
     tag: 100
     fabric: nt-data
     cidr: 10.100.2.0/24
+    gateway: 10.100.2.254       # rack-1 FRR ToR (stage 7)
 
-maas:
-  # Snap channel for the maas snap; maas-test-db follows the same channel.
-  # Changing this on an existing testbed requires `nt-testbed down && up`.
-  channel: 3.7/stable
-  admin_user: admin
-  admin_password: testbed
-  admin_email: admin@nt-testbed.local
-  vm_host_name: rack1-lxd
+# Rack 2 (stage 7). A second OVS bridge inside the same testbed VM with its own
+# rack controller container so MAAS derives rack identity from the boot VLAN's
+# primary rack controller. Mirrors rack 1 but on a disjoint address space.
+rack2:
+  bridge: br-rack2
+  controller: nt-rack2          # MAAS rack controller (system container)
+  pxe:
+    cidr: 10.101.1.0/24
+    gateway: 10.101.1.1         # rack-2 controller address on br-rack2
+    dhcp_range: {start: 10.101.1.100, end: 10.101.1.200}
+  vlans:
+    mgmt:
+      tag: 30
+      management: true
+      fabric: fabric-mgmt-r2
+      cidr: 10.101.4.0/24
+      gateway: 10.101.4.1
+      dhcp_range: {start: 10.101.4.100, end: 10.101.4.200}
+    data:
+      tag: 100
+      fabric: nt-data-r2
+      cidr: 10.100.6.0/24
+      gateway: 10.100.6.254     # rack-2 FRR ToR
 
-# Node NICs: index 0 is the boot NIC. `vlan` names an entry in vlans above
-# (omit for the untagged PXE segment); `ip` is the STATIC address MAAS
-# assigns, required so the topology JSON carries peer IPs before deployment.
+# ToR routers (stage 7): one FRR container per rack. Each owns its rack's data
+# subnet gateway and peers eBGP with the other over an inter-rack /30,
+# redistributing connected routes so cross-rack data traffic routes by BGP.
+# Management/PXE traffic between racks routes via the testbed VM (static), so
+# MAAS and Juju connectivity stays independent of the data-fabric routing.
+routers:
+  inter_rack_cidr: 10.100.5.0/30
+  rack-1: {name: frr-rack1, asn: 65001, data_ip: 10.100.2.254, link_ip: 10.100.5.1}
+  rack-2: {name: frr-rack2, asn: 65002, data_ip: 10.100.6.254, link_ip: 10.100.5.2}
+
+# Node NICs: index 0 is the boot NIC. `vlan` names an entry in the rack's vlans
+# (omit for the untagged PXE segment); `ip` is the STATIC address MAAS assigns,
+# required so the topology JSON carries peer IPs before deployment.
 #
-# `bond` (data nodes): two extra member NICs on br-rack1 aggregated into an
-# OVS LACP bond (lacp=active, lacp-time=slow) on the host side and a matching
-# 802.3ad bond inside MAAS. The bond carries the data VLAN tag and the STATIC
-# data IP; the LACP PDUs OVS sends let the bond-validator confirm bond mode
-# and cabling. The boot NIC stays on the mgmt VLAN so commissioning and the
-# Juju agent never depend on the bonded data fabric.
+# `bond` (data nodes): two extra member NICs aggregated into an OVS LACP bond
+# (lacp=active, lacp-time=slow) on the host side and a matching 802.3ad bond
+# inside MAAS. The bond carries the data VLAN tag and the STATIC data IP. The
+# boot NIC stays on the mgmt VLAN so commissioning and the Juju agent never
+# depend on the bonded data fabric. Each node's `rack` selects its bridge and
+# networks (rack-1 -> br-rack1/pxe/vlans, rack-2 -> br-rack2/rack2).
 racks:
   rack-1:
     nodes:
@@ -117,3 +149,20 @@ racks:
           - bridge: br-rack1
             vlan: oam
             ip: 10.100.3.11
+  rack-2:
+    nodes:
+      - hostname: r2-data-01
+        role: data
+        cpu: 2
+        memory_mib: 2048
+        disk_gib: 8
+        nics:
+          - bridge: br-rack2
+            vlan: mgmt
+            ip: 10.101.4.11
+        bond:
+          name: bond0
+          mode: 802.3ad
+          vlan: data
+          ip: 10.100.6.11
+          members: 2

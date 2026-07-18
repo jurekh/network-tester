@@ -38,6 +38,22 @@ MAAS_CFG = CONFIG["maas"]
 MAAS_URL = f"http://{PXE['gateway']}:5240/MAAS"
 VM_TREE = "/root/network-tester"
 
+# Rack 2 and ToR routers (stage 7); absent on a single-rack topology.
+RACK2 = CONFIG.get("rack2")
+ROUTERS = CONFIG.get("routers")
+
+
+def rack_net(rack):
+    """Bridge / pxe / vlans for a rack name (rack-1 is the top-level network)."""
+    if rack == "rack-1" or RACK2 is None:
+        return {"bridge": PXE["bridge"], "pxe": PXE, "vlans": VLANS}
+    return {"bridge": RACK2["bridge"], "pxe": RACK2["pxe"], "vlans": RACK2["vlans"]}
+
+
+def all_racks():
+    """Rack names present in the topology, rack-1 first."""
+    return list(CONFIG["racks"].keys())
+
 SYNC_EXCLUDES = [
     ".git",
     ".venv",
@@ -106,14 +122,22 @@ def wait_for(desc, predicate, timeout, interval=10):
 
 def expected_nodes():
     nodes = []
-    for rack in CONFIG["racks"].values():
-        nodes.extend(rack["nodes"])
+    for rack_name, rack in CONFIG["racks"].items():
+        for node in rack["nodes"]:
+            node.setdefault("rack", rack_name)
+            nodes.append(node)
     return nodes
 
 
-def nic_cidr(nic):
-    """The subnet a configured NIC belongs to (PXE when untagged)."""
-    return VLANS[nic["vlan"]]["cidr"] if nic.get("vlan") else PXE["cidr"]
+def node_net(node):
+    """Bridge / pxe / vlans for the rack a node belongs to."""
+    return rack_net(node.get("rack", "rack-1"))
+
+
+def nic_cidr(node, nic):
+    """The subnet a configured NIC belongs to (the rack PXE when untagged)."""
+    net = node_net(node)
+    return net["vlans"][nic["vlan"]]["cidr"] if nic.get("vlan") else net["pxe"]["cidr"]
 
 
 def node_bond(node):
@@ -599,13 +623,15 @@ def ensure_node_networking():
     for node in expected_nodes():
         host = node["hostname"]
         nics_cfg = node.get("nics", [])
+        vlans = node_net(node)["vlans"]
+        bridge = node_net(node)["bridge"]
         devices = inner_nic_devices(host)
         if not devices:
             fatal(f"inner LXD has no instance named {host}")
         names = sorted(devices)
         changed = False
         boot_dev = names[0]
-        want_tag = VLANS[nics_cfg[0]["vlan"]]["tag"] if nics_cfg[0].get("vlan") else None
+        want_tag = vlans[nics_cfg[0]["vlan"]]["tag"] if nics_cfg[0].get("vlan") else None
         have_tag = devices[boot_dev].get("vlan")
         if want_tag is not None and str(want_tag) != str(have_tag or ""):
             log(f"{host}: tagging boot NIC {boot_dev} onto VLAN {want_tag}")
@@ -616,7 +642,7 @@ def ensure_node_networking():
             if device in devices:
                 continue
             nic = nics_cfg[idx]
-            tag = VLANS[nic["vlan"]]["tag"] if nic.get("vlan") else None
+            tag = vlans[nic["vlan"]]["tag"] if nic.get("vlan") else None
             tag_arg = f" vlan={tag}" if tag is not None else ""
             log(f"{host}: adding NIC {device} on {nic['bridge']}{tag_arg}")
             vm_run(
@@ -625,8 +651,8 @@ def ensure_node_networking():
             )
             changed = True
         # Bond member NICs attach untagged to the bridge; the OVS bond
-        # (the OVS bond) carries the VLAN tag and runs LACP, so the tag must
-        # not also sit on the access port.
+        # carries the VLAN tag and runs LACP, so the tag must not also sit on
+        # the access port.
         for device in bond_member_devices(node):
             if device in devices:
                 # A member that previously served as a tagged access NIC must
@@ -636,10 +662,8 @@ def ensure_node_networking():
                     vm_run(f"lxc config device unset {host} {device} vlan")
                     changed = True
                 continue
-            log(f"{host}: adding bond member NIC {device} on {PXE['bridge']}")
-            vm_run(
-                f"lxc config device add {host} {device} nic nictype=bridged parent={PXE['bridge']}"
-            )
+            log(f"{host}: adding bond member NIC {device} on {bridge}")
+            vm_run(f"lxc config device add {host} {device} nic nictype=bridged parent={bridge}")
             changed = True
         machine = machines.get(host)
         if machine is None:
@@ -687,7 +711,7 @@ def ensure_addressing():
             interface = by_mac.get(mac)
             if interface is None:
                 fatal(f"{host}: MAAS has no interface with MAC {mac}; recommission needed")
-            subnet = subnets[nic_cidr(nic)]
+            subnet = subnets[nic_cidr(node, nic)]
             if (interface.get("vlan") or {}).get("id") != subnet["vlan"]["id"]:
                 maas_json(
                     f"interface update {machine['system_id']} {interface['id']} "
@@ -775,8 +799,8 @@ def fix_guest_nic_speed(host):
 
 
 def reconcile(cfg):
-    bridge = cfg["bridge"]
     for node in cfg["nodes"]:
+        bridge = node["bridge"]
         members = [host_name(node["host"], dev) for dev in node["members"]]
         if not all(members):
             continue
@@ -812,9 +836,10 @@ if __name__ == "__main__":
 
 def build_ovs_bond(node):
     """(Re)build a node's unified OVS LACP bond from its running member veths."""
-    bridge = PXE["bridge"]
+    net = node_net(node)
+    bridge = net["bridge"]
     name = ovs_bond_name(node["hostname"])
-    tag = VLANS[node_bond(node)["vlan"]]["tag"]
+    tag = net["vlans"][node_bond(node)["vlan"]]["tag"]
     ports = _bond_member_ports(node)
     for extra in swap_extra_names(node["hostname"]).values():
         vm_run(f"ovs-vsctl --if-exists del-port {bridge} {extra}", check=False)
@@ -839,12 +864,12 @@ def ensure_bond_reconciler():
     if not bonded:
         return
     config = {
-        "bridge": PXE["bridge"],
         "nodes": [
             {
                 "host": n["hostname"],
+                "bridge": node_net(n)["bridge"],
                 "ovs_bond": ovs_bond_name(n["hostname"]),
-                "tag": VLANS[node_bond(n)["vlan"]]["tag"],
+                "tag": node_net(n)["vlans"][node_bond(n)["vlan"]]["tag"],
                 "members": bond_member_devices(n),
             }
             for n in bonded
@@ -896,7 +921,7 @@ def ensure_maas_bonds():
         members = [by_mac[m] for m in member_macs if m in by_mac]
         if len(members) != len(bond_member_devices(node)):
             fatal(f"{host}: MAAS missing physical interfaces for bond members; recommission")
-        subnet = subnets[VLANS[bond["vlan"]]["cidr"]]
+        subnet = subnets[node_net(node)["vlans"][bond["vlan"]]["cidr"]]
         bond_iface = next(
             (
                 i
@@ -1183,7 +1208,7 @@ def verify_foundation():
             for link in nic.get("links", [])
             if link.get("subnet")
         }
-        wanted = {nic_cidr(nic) for nic in node.get("nics", [])}
+        wanted = {nic_cidr(node, nic) for nic in node.get("nics", [])}
         if not wanted <= subnets:
             failures.append(
                 f"{m['hostname']}: missing subnet records for {sorted(wanted - subnets)} "
@@ -1682,10 +1707,11 @@ def clear_incomplete_config():
 
 def _node_tagged_nics(node):
     """(index, nic, tag) for each NIC of a node that has a VLAN tag."""
+    vlans = node_net(node)["vlans"]
     out = []
     for idx, nic in enumerate(node.get("nics", [])):
         if nic.get("vlan"):
-            out.append((idx, nic, VLANS[nic["vlan"]]["tag"]))
+            out.append((idx, nic, vlans[nic["vlan"]]["tag"]))
     return out
 
 
@@ -1711,7 +1737,7 @@ def fault_wrong_vlan(args):
     idx, _nic, _tag = data[0]
     devices = sorted(inner_nic_devices(hostname))
     device = devices[idx]
-    other_tag = VLANS["oam"]["tag"]
+    other_tag = node_net(node)["vlans"]["oam"]["tag"]
     vm_run(f"ovs-vsctl set port {_ovs_port_for(hostname, device)} tag={other_tag}")
     log(f"fault injected: {hostname} {device} retagged to VLAN {other_tag} (oam)")
 
