@@ -22,13 +22,14 @@ marks where `fault <name>` injects a fault.
  |                                                                         |
  |  MAAS region+rack (region API :5240)        Juju controller (inner LXD) |
  |        |                                            |                   |
- |   br-pxe / mgmt+PXE bridge  <------- control plane (MAAS + Juju) -------+
- |        |  (rack-1 boot NICs tagged to mgmt VLAN after commission;       |
- |        |   rack-2 boot NICs on br-rack2 PXE access VLAN 99)             |
+ |   br-pxe (compose/PXE Linux bridge) <----- control plane (MAAS + Juju) -+
  |        |                                                                |
  |   =========================== RACK 1 ===========================        |
+ |   br-mgmt / br-oam (Linux bridges = rack-1 boot segments; single        |
+ |     |   commission PXE served over a real netdev, like br-pxe)          |
+ |     |   r1-data boot NIC -> br-mgmt;  r1-oam boot NIC -> br-oam         |
  |   br-rack1 (OVS = ToR switch)                                           |
- |     | data VLAN 100                                                     |
+ |     | data VLAN 100 (LACP bonds only)                                   |
  |     +-- r1-data-01  bond0 (802.3ad, lacp slow) [F:bond-static]          |
  |     |                                          [F:bond-passive]         |
  |     |                                          [F:bond-swap]            |
@@ -106,7 +107,7 @@ from `topology.yaml`.
 
 - `incomplete-config <node>` - removes a node's boot-interface subnet link
   (pre-flight failure).
-- `wrong-vlan <node>` - retags a node's data NIC onto the oam VLAN.
+- `wrong-vlan <node>` - moves a data node's bond members onto the oam bridge.
 - `bond-static <node>` - disables LACP on the node's OVS bond
   (`bond-mode-mismatch`, static-switch hint).
 - `bond-passive <node>` - sets the OVS bond and the deployed node's kernel
@@ -170,7 +171,7 @@ captures real LACP PDUs from the OVS bond within the 35 s slow-rate window
 Each data node's two extra member NICs are aggregated into an OVS bond
 (`lacp=active`, `other_config:lacp-time=slow`) carrying the data VLAN; the
 node runs a matching MAAS 802.3ad bond with `bond_lacp_rate=slow`. The boot
-NIC stays on the mgmt VLAN so commissioning and the Juju agent never depend
+NIC stays on the mgmt bridge so commissioning and the Juju agent never depend
 on the bonded data fabric.
 
 ### OVS-vs-real-switch caveats
@@ -212,9 +213,11 @@ two distinct MAAS racks to work with:
   port carries only its own VLAN, so the boot NICs never see the data VLAN;
   endpoints still see untagged PXE, so MAAS's view is unchanged and the
   gateway stays on `br-rack2`, which MAAS's scanner ignores (so the region
-  controller gains no interface on the rack-2 PXE subnet). Rack 1 needs no
-  access VLAN: its boot NICs are tagged onto the mgmt VLAN after
-  commissioning, which already isolates them from the data VLAN.
+  controller gains no interface on the rack-2 PXE subnet). Rack 1 takes a
+  different shape: its boot NICs sit on dedicated Linux bridges (`br-mgmt`,
+  `br-oam`) served by the region+rack rackd, so a fresh node's first-boot PXE
+  is served over a real netdev and each node commissions once; a bridge per
+  segment also isolates the boot NICs from the OVS data VLAN.
 - One FRR (FRRouting) container per rack acting as the ToR router:
   `frr-rack1` and `frr-rack2`. Each owns its rack's data-subnet gateway
   (`10.100.2.254` / `10.100.6.254`), peers eBGP with the other over an
@@ -225,7 +228,7 @@ two distinct MAAS racks to work with:
 
 The `up` ordering matters: `br-rack2` is created only after rack-1 subnet
 discovery completes, because an extra bridge present during MAAS region init
-perturbs MAAS fabric auto-linking (the rack-1 oam VLAN mis-links otherwise).
+perturbs MAAS fabric auto-linking for the rack-1 segments.
 
 ## verify multirack
 
@@ -250,7 +253,7 @@ cross-rack baseline, then injects three faults via `--reuse-model`:
 The rack-2 controller, both FRR routers, and the rack-2 data nodes are all
 composed inside the testbed VM, so a multi-rack `up` from scratch runs
 longer than the single-rack build (image import + rack-1 commission + rack-2
-controller/FRR + rack-2 compose/recommission).
+controller/FRR + rack-2 compose/commission).
 
 ## verify timeout
 

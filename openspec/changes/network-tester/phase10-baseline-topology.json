@@ -1,0 +1,234 @@
+[
+  {
+    "hostname": "r1-data-01",
+    "interfaces": [
+      {
+        "fabric": "nt-data",
+        "links": [
+          {
+            "ip": "10.100.2.11",
+            "mode": "static",
+            "subnet": "10.100.2.0/24"
+          }
+        ],
+        "name": "bond0",
+        "parents": [
+          "enp6s0",
+          "enp7s0"
+        ],
+        "type": "bond",
+        "vlan_vid": 100
+      },
+      {
+        "fabric": "fabric-0",
+        "links": [
+          {
+            "ip": "10.100.4.11",
+            "mode": "static",
+            "subnet": "10.100.4.0/24"
+          }
+        ],
+        "name": "enp5s0",
+        "parents": [],
+        "type": "physical",
+        "vlan_vid": 30
+      },
+      {
+        "fabric": "nt-data",
+        "links": [],
+        "name": "enp6s0",
+        "parents": [],
+        "type": "physical",
+        "vlan_vid": 100
+      },
+      {
+        "fabric": "nt-data",
+        "links": [],
+        "name": "enp7s0",
+        "parents": [],
+        "type": "physical",
+        "vlan_vid": 100
+      }
+    ],
+    "status": "Ready"
+  },
+  {
+    "hostname": "r1-data-02",
+    "interfaces": [
+      {
+        "fabric": "nt-data",
+        "links": [
+          {
+            "ip": "10.100.2.12",
+            "mode": "static",
+            "subnet": "10.100.2.0/24"
+          }
+        ],
+        "name": "bond0",
+        "parents": [
+          "enp6s0",
+          "enp7s0"
+        ],
+        "type": "bond",
+        "vlan_vid": 100
+      },
+      {
+        "fabric": "fabric-0",
+        "links": [
+          {
+            "ip": "10.100.4.12",
+            "mode": "static",
+            "subnet": "10.100.4.0/24"
+          }
+        ],
+        "name": "enp5s0",
+        "parents": [],
+        "type": "physical",
+        "vlan_vid": 30
+      },
+      {
+        "fabric": "nt-data",
+        "links": [],
+        "name": "enp6s0",
+        "parents": [],
+        "type": "physical",
+        "vlan_vid": 100
+      },
+      {
+        "fabric": "nt-data",
+        "links": [],
+        "name": "enp7s0",
+        "parents": [],
+        "type": "physical",
+        "vlan_vid": 100
+      }
+    ],
+    "status": "Ready"
+  },
+  {
+    "hostname": "r1-oam-01",
+    "interfaces": [
+      {
+        "fabric": "fabric-0",
+        "links": [
+          {
+            "ip": "10.100.3.11",
+            "mode": "static",
+            "subnet": "10.100.3.0/24"
+          }
+        ],
+        "name": "enp5s0",
+        "parents": [],
+        "type": "physical",
+        "vlan_vid": 10
+      }
+    ],
+    "status": "Ready"
+  },
+  {
+    "hostname": "r2-data-01",
+    "interfaces": [
+      {
+        "fabric": "nt-data-r2",
+        "links": [
+          {
+            "ip": "10.100.6.11",
+            "mode": "static",
+            "subnet": "10.100.6.0/24"
+          }
+        ],
+        "name": "bond0",
+        "parents": [
+          "enp6s0",
+          "enp7s0"
+        ],
+        "type": "bond",
+        "vlan_vid": 100
+      },
+      {
+        "fabric": "fabric-4",
+        "links": [
+          {
+            "ip": "10.101.1.11",
+            "mode": "static",
+            "subnet": "10.101.1.0/24"
+          }
+        ],
+        "name": "enp5s0",
+        "parents": [],
+        "type": "physical",
+        "vlan_vid": 0
+      },
+      {
+        "fabric": "nt-data-r2",
+        "links": [],
+        "name": "enp6s0",
+        "parents": [],
+        "type": "physical",
+        "vlan_vid": 100
+      },
+      {
+        "fabric": "nt-data-r2",
+        "links": [],
+        "name": "enp7s0",
+        "parents": [],
+        "type": "physical",
+        "vlan_vid": 100
+      }
+    ],
+    "status": "Ready"
+  },
+  {
+    "hostname": "r2-data-02",
+    "interfaces": [
+      {
+        "fabric": "nt-data-r2",
+        "links": [
+          {
+            "ip": "10.100.6.12",
+            "mode": "static",
+            "subnet": "10.100.6.0/24"
+          }
+        ],
+        "name": "bond0",
+        "parents": [
+          "enp6s0",
+          "enp7s0"
+        ],
+        "type": "bond",
+        "vlan_vid": 100
+      },
+      {
+        "fabric": "fabric-4",
+        "links": [
+          {
+            "ip": "10.101.1.12",
+            "mode": "static",
+            "subnet": "10.101.1.0/24"
+          }
+        ],
+        "name": "enp5s0",
+        "parents": [],
+        "type": "physical",
+        "vlan_vid": 0
+      },
+      {
+        "fabric": "nt-data-r2",
+        "links": [],
+        "name": "enp6s0",
+        "parents": [],
+        "type": "physical",
+        "vlan_vid": 100
+      },
+      {
+        "fabric": "nt-data-r2",
+        "links": [],
+        "name": "enp7s0",
+        "parents": [],
+        "type": "physical",
+        "vlan_vid": 100
+      }
+    ],
+    "status": "Ready"
+  }
+]

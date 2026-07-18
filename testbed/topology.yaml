@@ -24,9 +24,10 @@ maas:
   admin_email: admin@nt-testbed.local
   vm_host_name: rack1-lxd
 
-# Management/PXE network for rack 1, served by MAAS DHCP inside the testbed VM.
-# Nodes only commission on the untagged segment; their NICs are then retagged
-# onto the VLANs below. The untagged segment keeps the MAAS region, inner LXD
+# PXE/BMC/compose network for rack 1, served by MAAS DHCP inside the testbed VM.
+# Nodes compose here without auto-commissioning, then their boot NIC moves to
+# its management bridge (mgmt/oam below) and the data NICs attach before a single
+# commission records everything. This segment keeps the MAAS region, inner LXD
 # API, and the Juju controller container, whose ARP traffic must not appear on
 # the segments the vlan-neighbor-validator captures on.
 #
@@ -35,9 +36,9 @@ maas:
 # fall back to macvlan (composed VMs then cannot reach the testbed VM's DHCP,
 # which is the macvlan parent) and the LXD BMC power query fails ("no rack
 # controllers can access the BMC"). A Linux bridge is reported reliably, so the
-# PXE/BMC/compose segment lives here. `ovs_bridge` is the OVS bridge that
-# carries the tagged mgmt/oam/data VLANs and the LACP bonds; node NICs move
-# there (bridged) after the first commission.
+# PXE/BMC/compose segment lives here. `ovs_bridge` is the OVS bridge that carries
+# the tagged data VLAN and the LACP bonds; node data NICs move there (bridged)
+# while the node is Ready, before its single commission.
 pxe:
   bridge: br-pxe
   ovs_bridge: br-rack1
@@ -45,28 +46,26 @@ pxe:
   gateway: 10.100.1.1          # testbed VM address on the PXE bridge
   dhcp_range: {start: 10.100.1.100, end: 10.100.1.200}
 
-# Tagged VLANs carried over br-rack1 via OVS access-port tags on the node
-# ports. `management: true` VLANs get a rack-controller presence: a Linux
-# 802.1q subinterface (br-rack1.<tag>) on the bridge LOCAL port (an OVS
-# trunk), which MAAS discovers natively as a vid-tagged VLAN interface and
-# serves DHCP on. MAAS places each discovered subinterface on a vid-tagged
-# VLAN of the bridge's own fabric (fabric-0); the subnet/DHCP follow that
-# discovered VLAN (the `fabric:` keys below are descriptive only). The data
-# VLAN has a gateway only since stage 7: the rack-1 ToR router (FRR) owns
+# Rack-1 segments. Management VLANs (mgmt, oam) are each their own Linux bridge
+# (`bridge:`) on the testbed VM, served by the region+rack rackd like br-pxe:
+# a node's boot NIC attaches there, so its first-boot PXE is served over a real
+# Linux netdev and the node commissions once. A dedicated bridge per VLAN also
+# isolates each management segment from the data VLAN with no access-VLAN trunk.
+# The data VLAN stays an OVS access-port `tag:` on br-rack1, where the LACP bond
+# needs OVS; MAAS models it as its own data fabric (ensure_data_segments). The
+# data VLAN has a gateway only since stage 7: the rack-1 ToR router (FRR) owns
 # gateway_ip so cross-rack traffic routes; same-rack L2 neighbor checks are
 # unaffected.
 vlans:
   mgmt:
-    tag: 30
+    bridge: br-mgmt
     management: true
-    fabric: fabric-mgmt
     cidr: 10.100.4.0/24
     gateway: 10.100.4.1
     dhcp_range: {start: 10.100.4.100, end: 10.100.4.200}
   oam:
-    tag: 10
+    bridge: br-oam
     management: true
-    fabric: fabric-oam
     cidr: 10.100.3.0/24
     gateway: 10.100.3.1
     dhcp_range: {start: 10.100.3.100, end: 10.100.3.200}
@@ -139,7 +138,7 @@ racks:
         memory_mib: 2048
         disk_gib: 8
         nics:
-          - bridge: br-rack1
+          - bridge: br-mgmt
             vlan: mgmt
             ip: 10.100.4.11
         bond:
@@ -154,7 +153,7 @@ racks:
         memory_mib: 2048
         disk_gib: 8
         nics:
-          - bridge: br-rack1
+          - bridge: br-mgmt
             vlan: mgmt
             ip: 10.100.4.12
         bond:
@@ -171,7 +170,7 @@ racks:
         memory_mib: 2048
         disk_gib: 8
         nics:
-          - bridge: br-rack1
+          - bridge: br-oam
             vlan: oam
             ip: 10.100.3.11
   rack-2:

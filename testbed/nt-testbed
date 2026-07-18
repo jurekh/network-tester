@@ -150,9 +150,10 @@ def wait_or_restart(desc, predicate, timeout=180, interval=15):
     """Wait for predicate; if it stalls, restart MAAS once and wait again.
 
     MAAS rackd intermittently drops the OVS bridge interfaces (br-rack1,
-    br-rack1.<tag>, br-rack2) from the controller's reported interface set, so
-    interface-discovery waits can stall even though the bridges are up in the
-    VM. A MAAS restart forces a fresh rackd interface scan that restores them.
+    br-rack2) and the management-VLAN veth netdevs (vrc<tag>) from the
+    controller's reported interface set, so interface-discovery waits can stall
+    even though the devices are up in the VM. A MAAS restart forces a fresh
+    rackd interface scan that restores them.
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -395,17 +396,17 @@ def ensure_maas():
 
 
 def ensure_dhcp_rebind():
-    """After a VM restart, restart MAAS so dhcpd rebinds to the VLAN subinterfaces.
+    """After a VM restart, restart MAAS so dhcpd rebinds to the VLAN netdevs.
 
-    Restarting the VM recreates br-rack1.<tag>; the persisted dhcpd stays bound
-    to the old interface instances and silently stops answering PXE DHCP, so
-    node deploys fall through to the stale on-disk image and never reinstall.
-    Restarting MAAS rebinds dhcpd. Only needed on a restart of an already-built
-    testbed, so it is skipped on a fresh bring-up.
+    Restarting the VM recreates the management-VLAN veth netdevs (vrc<tag>); the
+    persisted dhcpd stays bound to the old interface instances and silently
+    stops answering PXE DHCP, so node deploys fall through to the stale on-disk
+    image and never reinstall. Restarting MAAS rebinds dhcpd. Only needed on a
+    restart of an already-built testbed, so it is skipped on a fresh bring-up.
     """
     if not _STATE["vm_restarted"]:
         return
-    log("VM was restarted; restarting MAAS to rebind dhcpd to the VLAN subinterfaces")
+    log("VM was restarted; restarting MAAS to rebind dhcpd to the VLAN netdevs")
     vm_run("snap restart maas")
     wait_for(
         "MAAS API",
@@ -525,7 +526,14 @@ def ensure_vm_host():
 
 
 def _compose_machine(host_id, node):
-    """Compose one node, recovering from MAAS dropping the host bridges.
+    """Compose one node without auto-commissioning, recovering from bridge drops.
+
+    `skip_commissioning=true` lands the node in MAAS as Ready and powered off
+    with only its composed boot NIC recorded; MAAS does not first-boot or
+    commission it. ensure_node_networking then attaches the final NIC set and
+    commissions the node exactly once, so the whole testbed records each node's
+    per-segment topology in a single commission (no dual stage). See
+    openspec/changes/network-tester/phase10-single-stage-findings.md.
 
     Composing a VM creates a tap on the bridge, which makes rackd rescan, and
     rackd intermittently drops the OVS bridges from its interface report during
@@ -537,7 +545,7 @@ def _compose_machine(host_id, node):
     cmd = (
         f"vm-host compose {host_id} cores={node['cpu']} "
         f"memory={node['memory_mib']} hostname={host} "
-        f"storage=main:{node['disk_gib']}"
+        f"storage=main:{node['disk_gib']} skip_commissioning=true"
     )
     restarts = 0
     cleaned = False
@@ -583,14 +591,16 @@ def _wait_pod_networks():
 
 
 def ensure_machines():
-    """Compose every expected node, then wait for them all to reach Ready.
+    """Compose every expected node (Ready, not commissioned).
 
-    Composes are fired for all not-yet-existing nodes and MAAS commissions them
-    in parallel; the single wait at the end gates `up`. Composing on the Linux
-    PXE bridge (which MAAS reports reliably) and pinning the OVS bridge MACs
-    removed the rackd bridge-drop that earlier forced one-node-at-a-time
-    commissioning, so per-node serialization and its restart/recompose recovery
-    are no longer needed.
+    Composes are fired for all not-yet-existing nodes with
+    `skip_commissioning=true`, so each lands Ready and powered off with only its
+    boot NIC recorded; no node commissions here. ensure_node_networking then
+    attaches the final NIC set and commissions each node exactly once. Composing
+    on the Linux PXE bridge (which MAAS reports reliably) and pinning the OVS
+    bridge MACs removed the rackd bridge-drop that earlier forced
+    one-node-at-a-time composition, so per-node serialization and its
+    restart/recompose recovery are no longer needed.
     """
     host_id = next(
         h["id"] for h in maas_json("vm-hosts read") if h["name"] == MAAS_CFG["vm_host_name"]
@@ -605,8 +615,7 @@ def ensure_machines():
                 f"({node['cpu']} CPU, {node['memory_mib']} MiB, {node['disk_gib']} GiB)"
             )
             _compose_machine(host_id, node)
-        wait_nodes_ready(timeout=1800)
-    log("all composed machines are Ready")
+    log("all expected nodes composed (Ready, awaiting single commission)")
 
 
 def _ensure_forward(cidr):
@@ -624,11 +633,6 @@ def _ensure_forward(cidr):
         )
 
 
-def vlan_device(tag):
-    """Kernel name of the Linux 802.1q subinterface for a tag on the bridge."""
-    return f"{PXE['ovs_bridge']}.{tag}"
-
-
 def management_vlans():
     return [(name, vlan) for name, vlan in VLANS.items() if vlan.get("management")]
 
@@ -638,35 +642,43 @@ def _rc_vlan_iface(rack_id, dev):
     return next((i for i in rc["interface_set"] if i["name"] == dev), None)
 
 
-def ensure_vlan_networks():
-    """Linux 802.1q VLAN subinterfaces plus MAAS subnet/DHCP for management VLANs.
+# Pinned MACs for the management Linux bridges, by VLAN name, so rackd never
+# drops them from its interface report when their member taps churn (see
+# pin_bridge_mac). Stable locally-administered values; distinct from br-pxe and
+# the OVS bridges.
+_MGMT_BRIDGE_MAC = {"mgmt": "02:00:00:aa:03:01", "oam": "02:00:00:aa:04:01"}
 
-    MAAS does not model OVS internal ports (its scanner reports only PCI cards
-    and its controller discovery cannot see OVS-internal VLAN tags), so the
-    rack-controller's presence on each management VLAN is a Linux 802.1q
-    subinterface (br-rack1.<tag>) on the bridge LOCAL port, which is an OVS
-    trunk. MAAS discovers these natively as vid-tagged VLAN interfaces and
-    serves DHCP on them; OVS bridges their frames to the nodes' access-tagged
-    ports. MAAS places each discovered subinterface on a vid-tagged VLAN of
-    the bridge's own fabric (fabric-0), so the subnet/range/DHCP bind to that
-    discovered VLAN rather than a separate pre-created fabric. The data VLAN
-    has no controller presence (ensure_data_segments models it as its own
-    data fabric). Run before the inner LXD exists so the controller refresh
+
+def ensure_vlan_networks():
+    """A Linux bridge per management VLAN, plus MAAS subnet/DHCP.
+
+    Each management VLAN (mgmt, oam) is its own Linux bridge (br-mgmt, br-oam)
+    on the testbed VM, carrying the gateway and NAT and served by the region+rack
+    rackd exactly like br-pxe. Rack-1 nodes boot on these bridges, so a fresh
+    node's first-boot PXE is served over a real Linux netdev and the node
+    commissions once. An OVS bridge LOCAL-port 802.1q subinterface does not serve
+    fresh-node PXE (only already-enlisted nodes boot against it), and a veth into
+    the OVS bridge pollutes the controller's own interface set; a dedicated Linux
+    bridge avoids both. A bridge per VLAN also isolates each management segment
+    from the tagged data VLAN with no access-VLAN trunk: the boot NIC's bridge
+    carries only its own segment. Only the data VLAN stays on OVS (br-rack1),
+    where the LACP bond needs it. MAAS discovers each bridge as an untagged
+    interface on its own fabric and binds the subnet/range/DHCP there (subnet
+    follows interface). Run before the inner LXD exists so the controller refresh
     sees a stable interface set.
     """
     mgmt = management_vlans()
     if not mgmt:
         return
-    bridge = PXE["ovs_bridge"]
     for name, vlan in mgmt:
-        tag, cidr, gateway = vlan["tag"], vlan["cidr"], vlan["gateway"]
-        dev = vlan_device(tag)
+        bridge, cidr, gateway = vlan["bridge"], vlan["cidr"], vlan["gateway"]
         prefix = cidr.split("/")[1]
-        vm_run(
-            f"ip link show {dev} >/dev/null 2>&1 || "
-            f"ip link add link {bridge} name {dev} type vlan id {tag}"
-        )
-        vm_run(f"ip addr replace {gateway}/{prefix} dev {dev} && ip link set {dev} up")
+        if not vm_ok(f"ip link show {bridge} >/dev/null 2>&1"):
+            vm_run(f"ip link add {bridge} type bridge")
+        mac = _MGMT_BRIDGE_MAC.get(name)
+        if mac:
+            vm_run(f"ip link set {bridge} address {mac}")
+        vm_run(f"ip addr replace {gateway}/{prefix} dev {bridge} && ip link set {bridge} up")
         vm_run(
             f"iptables -t nat -C POSTROUTING -s {cidr} ! -d {cidr} -j MASQUERADE 2>/dev/null"
             f" || iptables -t nat -A POSTROUTING -s {cidr} ! -d {cidr} -j MASQUERADE"
@@ -675,29 +687,28 @@ def ensure_vlan_networks():
 
     rack_id = maas_json("rack-controllers read")[0]["system_id"]
 
-    # MAAS models an 802.1q subinterface on br-rack1 as a vid-tagged VLAN on
-    # the bridge's own fabric (fabric-0); it does not place it on a separate
-    # pre-created fabric, and a vlan-type interface cannot be reassigned to
-    # another fabric afterwards. So wait for the rack controller to discover
-    # each subinterface, then bind that discovered VLAN's subnet, dynamic
-    # range, and DHCP to it (subnet follows interface). Doing this before
-    # discovery races the controller refresh: the subnet lands on a stale
-    # fabric and DHCP cannot be enabled on the interface's real VLAN.
+    # MAAS discovers each management bridge as an untagged interface on its own
+    # fabric (like br-pxe); wait for discovery, then bind that VLAN's subnet,
+    # dynamic range, and DHCP to it (subnet follows interface). Doing this before
+    # discovery races the controller refresh.
     def discovered():
         for name, vlan in mgmt:
-            iface = _rc_vlan_iface(rack_id, vlan_device(vlan["tag"]))
-            if iface is None or (iface.get("vlan") or {}).get("vid") != vlan["tag"]:
+            iface = _rc_vlan_iface(rack_id, vlan["bridge"])
+            if iface is None or iface.get("vlan") is None:
                 return False
         return True
 
     wait_or_restart(
-        "rack-controller VLAN interface discovery", discovered, timeout=180, interval=15
+        "rack-controller management-bridge interface discovery",
+        discovered,
+        timeout=180,
+        interval=15,
     )
 
     ranges = maas_json("ipranges read")
     for name, vlan in mgmt:
-        tag, cidr, gateway = vlan["tag"], vlan["cidr"], vlan["gateway"]
-        iface = _rc_vlan_iface(rack_id, vlan_device(tag))
+        cidr, gateway = vlan["cidr"], vlan["gateway"]
+        iface = _rc_vlan_iface(rack_id, vlan["bridge"])
         mvlan = iface["vlan"]
         subnet = next((s for s in maas_json("subnets read") if s["cidr"] == cidr), None)
         if subnet is None:
@@ -712,12 +723,14 @@ def ensure_vlan_networks():
             log(f"creating dynamic DHCP range for VLAN {name}: {rng['start']}-{rng['end']}")
             maas_json(f"ipranges create type=dynamic start_ip={rng['start']} end_ip={rng['end']}")
         if not mvlan["dhcp_on"]:
-            log(f"enabling MAAS DHCP on VLAN {name} (fabric {mvlan['fabric_id']} vid {tag})")
+            log(
+                f"enabling MAAS DHCP on VLAN {name} (fabric {mvlan['fabric_id']} vid {mvlan['vid']})"
+            )
             maas_json(
                 f"vlan update {mvlan['fabric_id']} {mvlan['vid']} "
                 f"dhcp_on=true primary_rack={rack_id}"
             )
-    log("management VLAN networks configured (802.1q subinterfaces, subnets, DHCP)")
+    log("management VLAN networks configured (Linux bridges, subnets, DHCP)")
 
 
 def _data_vlans():
@@ -905,7 +918,7 @@ def ensure_rack2_controller():
 
     # Rack-2 nodes PXE boot via this controller's maas-agent boot proxy (port
     # 5248), which proxies/caches bootloaders from the region. Gate here, before
-    # the rack-2 nodes are recommissioned in ensure_node_networking, on that
+    # the rack-2 nodes are commissioned in ensure_node_networking, on that
     # proxy actually serving bootx64.efi (the URL nodes fetch over PXE). A 502
     # means the agent is unhealthy and the nodes would fail to PXE boot and
     # stall in Commissioning. The check runs inside the container against its
@@ -1097,12 +1110,17 @@ def set_nic_vlan(host, device, tag):
 
 
 def ensure_node_networking():
-    """Attach per-node NIC devices with OVS tags; recommission changed nodes.
+    """Attach each node's final NIC set, then commission it exactly once.
 
-    Composed nodes first commission on the untagged PXE segment; this step
-    retags their boot NIC onto the configured VLAN (which has MAAS DHCP),
-    adds any additional NICs, and recommissions so MAAS records the NICs on
-    the right segments.
+    Nodes are composed Ready but uncommissioned (skip_commissioning), with only
+    their boot NIC on the PXE bridge. This step moves that boot NIC onto its
+    final segment (rack-1 mgmt/oam Linux bridge, rack-2 PXE access VLAN on
+    br-rack2), attaches the data bond-member NICs untagged on the rack's OVS
+    bridge, and commissions the node once so its first and only boot records the
+    complete per-segment topology. Rack-1 nodes PXE over the management Linux
+    bridge and rack-2 nodes via nt-rack2, so each commissions once and MAAS
+    derives the right rack. Idempotent: a re-run with the NICs already in place
+    and the topology already recorded commissions nothing.
     """
     machines = {m["hostname"]: m for m in maas_json("machines read")}
     to_commission = []
@@ -1117,8 +1135,9 @@ def ensure_node_networking():
         names = sorted(devices)
         changed = False
         boot_dev = names[0]
-        # Rack-2 nodes compose on br-pxe (the inner LXD default profile) and
-        # must move their boot NIC to br-rack2 so they commission via the
+        # Move the boot NIC to its final segment. Rack-1 boot NICs go to a
+        # management Linux bridge (br-mgmt/br-oam) where rackd serves PXE over a
+        # real netdev; rack-2 boot NICs go to br-rack2 so they commission via the
         # rack-2 controller and MAAS derives rack 2.
         boot_bridge = nics_cfg[0].get("bridge", bridge)
         have_parent = devices[boot_dev].get("parent") or devices[boot_dev].get("network")
@@ -1129,12 +1148,13 @@ def ensure_node_networking():
                 check=False,
             )
             changed = True
-        # A configured boot VLAN tags the NIC onto that VLAN; an untagged boot
-        # NIC on a rack with a PXE access VLAN (rack 2 on the shared OVS bridge)
-        # is tagged onto the access VLAN so the data VLAN cannot reach it. The
-        # access tag is OVS-internal, so the node still sees an untagged NIC.
+        # A boot NIC on an OVS bridge needs an access tag: a tagged management
+        # VLAN, or (rack 2's shared OVS bridge) the PXE access VLAN so the data
+        # VLAN cannot reach it. Bridge-backed management VLANs (rack-1 mgmt/oam,
+        # their own Linux bridge) carry no tag, so want_tag is None and the NIC
+        # stays untagged on its bridge.
         want_tag = (
-            vlans[nics_cfg[0]["vlan"]]["tag"]
+            vlans[nics_cfg[0]["vlan"]].get("tag")
             if nics_cfg[0].get("vlan")
             else node_net(node)["pxe_access_vlan"]
         )
@@ -1148,7 +1168,7 @@ def ensure_node_networking():
             if device in devices:
                 continue
             nic = nics_cfg[idx]
-            tag = vlans[nic["vlan"]]["tag"] if nic.get("vlan") else None
+            tag = vlans[nic["vlan"]].get("tag") if nic.get("vlan") else None
             tag_arg = f" vlan={tag}" if tag is not None else ""
             log(f"{host}: adding NIC {device} on {nic['bridge']}{tag_arg}")
             vm_run(
@@ -1180,8 +1200,8 @@ def ensure_node_networking():
     for host in to_commission:
         machine = machines[host]
         if machine["status_name"] != "Ready":
-            fatal(f"cannot recommission {host} in state {machine['status_name']}")
-        log(f"recommissioning {host} to record NIC changes")
+            fatal(f"cannot commission {host} in state {machine['status_name']}")
+        log(f"commissioning {host} to record its full per-segment topology")
         maas_json(f"machine commission {machine['system_id']}")
     if to_commission:
         wait_nodes_ready(timeout=1800)
@@ -2580,56 +2600,53 @@ def clear_incomplete_config():
     ensure_addressing()
 
 
-def _node_tagged_nics(node):
-    """(index, nic, tag) for each NIC of a node that has a VLAN tag."""
-    vlans = node_net(node)["vlans"]
-    out = []
-    for idx, nic in enumerate(node.get("nics", [])):
-        if nic.get("vlan"):
-            out.append((idx, nic, vlans[nic["vlan"]]["tag"]))
-    return out
-
-
-def _ovs_port_for(host, device):
-    """The OVS port name backing a running instance's NIC device."""
-    port = vm_out(f"lxc config get {host} volatile.{device}.host_name", check=False)
-    if not port:
-        fatal(f"{host} {device} has no host-side port; is the instance running?")
-    return port
-
-
 def fault_wrong_vlan(args):
-    """Retag a node's data NIC onto the oam VLAN (wrong segment)."""
+    """Move a data node's bond members onto the oam segment (wrong VLAN).
+
+    The data fabric is OVS (br-rack1); oam is its own Linux bridge (br-oam). To
+    mis-cable the data NICs onto oam, pause the reconciler, drop the node's OVS
+    data bond, and enslave its member host ports to br-oam. The data peer then
+    loses the node (missing-l2-neighbor) and the oam node sees the data MACs
+    (unexpected-l2-neighbor). clear_wrong_vlan frees the ports and clear_bond
+    rebuilds the OVS bond.
+    """
     if len(args) != 1:
         fatal("usage: nt-testbed fault wrong-vlan <hostname>")
     hostname = args[0]
     node = next((n for n in expected_nodes() if n["hostname"] == hostname), None)
-    if node is None:
-        fatal(f"no node named {hostname} in topology.yaml")
-    data = [(i, n, t) for i, n, t in _node_tagged_nics(node) if n["vlan"] == "data"]
-    if not data:
-        fatal(f"{hostname} has no data NIC to retag")
-    idx, _nic, _tag = data[0]
-    devices = sorted(inner_nic_devices(hostname))
-    device = devices[idx]
-    other_tag = node_net(node)["vlans"]["oam"]["tag"]
-    vm_run(f"ovs-vsctl set port {_ovs_port_for(hostname, device)} tag={other_tag}")
-    log(f"fault injected: {hostname} {device} retagged to VLAN {other_tag} (oam)")
+    if node is None or not node_bond(node):
+        fatal(f"{hostname} is not a bonded data node in topology.yaml")
+    oam_bridge = VLANS["oam"]["bridge"]
+    bridge = PXE["ovs_bridge"]
+    _pause_reconciler()
+    ports = _bond_member_ports(node)
+    vm_run(f"ovs-vsctl --if-exists del-port {bridge} {ovs_bond_name(hostname)}")
+    for port in ports:
+        vm_run(f"ovs-vsctl --if-exists del-port {bridge} {port}", check=False)
+        vm_run(f"ip link set {port} master {oam_bridge}")
+    log(f"fault injected: {hostname} bond members {ports} moved to {oam_bridge} (oam)")
 
 
 def clear_wrong_vlan():
-    """Restore configured OVS tags on all running nodes' NICs."""
+    """Free any data bond members previously moved onto the oam bridge.
+
+    Runs before clear_bond, which rebuilds the OVS bond from the freed ports.
+    A no-op when no wrong-vlan fault is active (the oam node's own boot NIC is
+    a legitimate br-oam member and is left untouched, since only bond-member
+    host ports are considered).
+    """
+    oam_bridge = VLANS.get("oam", {}).get("bridge")
+    if not oam_bridge:
+        return
     for node in expected_nodes():
-        devices = sorted(inner_nic_devices(node["hostname"]))
-        for idx, _nic, tag in _node_tagged_nics(node):
-            if idx >= len(devices):
-                continue
+        if not node_bond(node) or not vm_ok(f"lxc exec {node['hostname']} -- true"):
+            continue
+        for device in bond_member_devices(node):
             port = vm_out(
-                f"lxc config get {node['hostname']} volatile.{devices[idx]}.host_name",
-                check=False,
+                f"lxc config get {node['hostname']} volatile.{device}.host_name", check=False
             )
-            if port:
-                vm_run(f"ovs-vsctl set port {port} tag={tag}", check=False)
+            if port and vm_ok(f"ip link show {port} 2>/dev/null | grep -q 'master {oam_bridge}'"):
+                vm_run(f"ip link set {port} nomaster", check=False)
 
 
 def _bond_node(args, cmd):
