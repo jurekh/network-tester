@@ -31,23 +31,23 @@ Execution is organized into stages. Each stage delivers a vertical slice of the 
 
 ## 3. Topology Fetcher and Read-Only CLI
 
-- [ ] 3.1 Implement `cli/maas_topology.py`: fetch machines in `ready` state from MAAS API using `--maas-url` and `--maas-key` CLI args; support `--all`, `--rack`, `--nodes` scoping with `in_scope` flags and retained known peers for classification
-- [ ] 3.2 Implement role derivation: query `/MAAS/api/2.0/rackcontrollers/` to get MAAS-designated rack controllers (these are `role: rack-controller` without further inference); use their fabric memberships to classify management vs. data fabrics; classify remaining machines as `bmc-oam` (management fabric only) or `data` (data fabric only)
-- [ ] 3.3 Fetch and record per-interface details: fabric name, VLAN tag, subnet CIDR, IP, MAC, gateway IP, bond members and mode from MAAS
-- [ ] 3.4 Fetch and retain rack-controller anchor records regardless of `ready` state; only selected deploy/probe targets are constrained to `ready`
-- [ ] 3.5 Implement pre-flight validation: check all selected machines have VLAN, fabric, and bond config present in MAAS; return structured list of failures
-- [ ] 3.6 Serialize topology model to JSON including `reachability_model` block and per-machine `in_scope`; write test asserting required top-level keys (`schema_version`, `scope`, `fabrics`, `machines`, `reachability_model`) and mixed in-scope/out-of-scope machines
-- [ ] 3.7 Implement `network-tester` CLI script (Python, `argparse`): subcommands `run`, `status`
-- [ ] 3.8 `run` subcommand: support normal deployment mode requiring exactly one of `--all`, `--rack <name>...`, `--nodes <id>...`; support reuse mode via mutually exclusive `--reuse-model`; add `--dry-run`, `--keep-model`, `--mac-manifest`, `--maas-url`, `--maas-key`, `--wait-timeout`, `--verbose` flags
-- [ ] 3.9 `run --dry-run`: fetch topology with `in_scope` flags, run pre-flight on in-scope machines, print selected nodes with roles, would-run checks, and would-skip checks with reasons; exit without deploying
-- [ ] 3.10 `run` pre-flight: call maas_topology pre-flight validation for in-scope machines; print failures and exit non-zero if any selected machine has incomplete config
-- [ ] 3.11 Unit test MAAS topology fetcher: mock MAAS API responses; assert correct role classification and fabric identification for each role
-- [ ] 3.12 Add mixed-interface role derivation tests: management-only -> `bmc-oam`, data-only -> `data`, management+data -> `data` with data-fabric target IP selection
-- [ ] 3.13 Unit test pre-flight validation: mock machines with missing VLAN and bond config; assert correct failure list returned
-- [ ] 3.14 Unit test topology serialization: assert required top-level keys including `reachability_model` block and per-machine `in_scope`; assert out-of-scope known peers are retained
-- [ ] 3.15 Testbed: `verify topology` runs `network-tester run --dry-run --all` inside the testbed VM against the testbed MAAS; assert the output lists the composed nodes with correct roles and the would-run/would-skip check sets
-- [ ] 3.16 Testbed fault: `fault incomplete-config <node>` removes the node's subnet link via the MAAS API; assert `network-tester run --all ...` pre-flight exits non-zero naming that machine; `fault clear` restores the link and `verify topology` passes again
-- [ ] 3.17 **Gate:** unit tests green; `verify topology` and the incomplete-config fault scenario pass against the testbed
+- [x] 3.1 Implement `cli/maas_topology.py`: fetch machines in `ready` state from MAAS API using `--maas-url` and `--maas-key` CLI args; support `--all`, `--rack`, `--nodes` scoping with `in_scope` flags and retained known peers for classification
+- [x] 3.2 Implement role derivation: query `/MAAS/api/2.0/rackcontrollers/` to get MAAS-designated rack controllers (these are `role: rack-controller` without further inference); use their fabric memberships to classify management vs. data fabrics; classify remaining machines as `bmc-oam` (management fabric only) or `data` (data fabric only)
+- [x] 3.3 Fetch and record per-interface details: fabric name, VLAN tag, subnet CIDR, IP, MAC, gateway IP, bond members and mode from MAAS
+- [x] 3.4 Fetch and retain rack-controller anchor records regardless of `ready` state; only selected deploy/probe targets are constrained to `ready`
+- [x] 3.5 Implement pre-flight validation: check all selected machines have VLAN, fabric, and bond config present in MAAS; return structured list of failures
+- [x] 3.6 Serialize topology model to JSON including `reachability_model` block and per-machine `in_scope`; write test asserting required top-level keys (`schema_version`, `scope`, `fabrics`, `machines`, `reachability_model`) and mixed in-scope/out-of-scope machines
+- [x] 3.7 Implement `network-tester` CLI script (Python, `argparse`): subcommands `run`, `status`
+- [x] 3.8 `run` subcommand: support normal deployment mode requiring exactly one of `--all`, `--rack <name>...`, `--nodes <id>...`; support reuse mode via mutually exclusive `--reuse-model`; add `--dry-run`, `--keep-model`, `--mac-manifest`, `--maas-url`, `--maas-key`, `--wait-timeout`, `--verbose` flags
+- [x] 3.9 `run --dry-run`: fetch topology with `in_scope` flags, run pre-flight on in-scope machines, print selected nodes with roles, would-run checks, and would-skip checks with reasons; exit without deploying
+- [x] 3.10 `run` pre-flight: call maas_topology pre-flight validation for in-scope machines; print failures and exit non-zero if any selected machine has incomplete config
+- [x] 3.11 Unit test MAAS topology fetcher: mock MAAS API responses; assert correct role classification and fabric identification for each role
+- [x] 3.12 Add mixed-interface role derivation tests: management-only -> `bmc-oam`, data-only -> `data`, management+data -> `data` with data-fabric target IP selection
+- [x] 3.13 Unit test pre-flight validation: mock machines with missing VLAN and bond config; assert correct failure list returned
+- [x] 3.14 Unit test topology serialization: assert required top-level keys including `reachability_model` block and per-machine `in_scope`; assert out-of-scope known peers are retained
+- [x] 3.15 Testbed: `verify topology` runs `network-tester run --dry-run --all` inside the testbed VM against the testbed MAAS; assert the output lists the composed nodes with correct roles and the would-run/would-skip check sets
+- [x] 3.16 Testbed fault: `fault incomplete-config <node>` removes the node's subnet link via the MAAS API; assert `network-tester run --all ...` pre-flight exits non-zero naming that machine; `fault clear` restores the link and `verify topology` passes again
+- [x] 3.17 **Gate:** unit tests green; `verify topology` and the incomplete-config fault scenario pass against the testbed
 
 ## 4. Walking Skeleton: Charm, Probe Runner, Collection, Minimal Report (E2E with Stub Validators)
 

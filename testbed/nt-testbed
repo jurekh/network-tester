@@ -17,6 +17,7 @@ fault clear. Configuration lives in topology.yaml next to this script.
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -498,18 +499,149 @@ def verify_foundation():
     log(f"verify foundation: PASS ({len(expected)} machines Ready on {PXE['cidr']})")
 
 
-VERIFY_STAGES = {"foundation": verify_foundation}
+def network_tester_run(extra_args):
+    """Run the network-tester CLI inside the testbed VM against its MAAS."""
+    key = vm_out(f"maas apikey --username {MAAS_CFG['admin_user']}")
+    return vm_run(
+        f"cd {VM_TREE} && uv run network-tester run {extra_args} "
+        f"--maas-url {MAAS_URL} --maas-key {key}",
+        check=False,
+        capture=True,
+    )
 
-FAULTS = {}  # populated by later stages
+
+def verify_topology():
+    """Dry-run against the testbed MAAS, plus the incomplete-config fault.
+
+    The stage-3 testbed has only the management/PXE network, so the composed
+    nodes classify as bmc-oam (their single fabric is a rack-controller
+    fabric); the data VLAN that makes them data-role arrives in stage 5.
+    """
+    sync_tree()
+    problems = []
+
+    log("verify topology: clean dry-run --all")
+    result = network_tester_run("--dry-run --all")
+    output = result.stdout + result.stderr
+    if result.returncode != 0:
+        problems.append(f"clean dry-run exited {result.returncode}:\n{output}")
+    else:
+        for node in expected_nodes():
+            pattern = rf"{node['hostname']} \(\w+\) rack=\S+ role=bmc-oam"
+            if not re.search(pattern, output):
+                problems.append(
+                    f"dry-run output missing '{node['hostname']} ... role=bmc-oam':\n{output}"
+                )
+        for section in ("Would run:", "Would skip:"):
+            if section not in output:
+                problems.append(f"dry-run output missing '{section}' section")
+        if "vlan-neighbor-validator" not in output:
+            problems.append("dry-run output lists no vlan-neighbor checks")
+
+    target = expected_nodes()[0]["hostname"]
+    log(f"verify topology: incomplete-config fault on {target}")
+    fault_incomplete_config([target])
+    result = network_tester_run("--all")
+    output = result.stdout + result.stderr
+    if result.returncode == 0:
+        problems.append("run --all succeeded despite incomplete config")
+    elif "Pre-flight validation failed" not in output or target not in output:
+        problems.append(f"pre-flight failure does not name {target}:\n{output}")
+
+    log("verify topology: fault clear and re-check")
+    clear_faults()
+    result = network_tester_run("--dry-run --all")
+    if result.returncode != 0:
+        problems.append(
+            f"dry-run after fault clear exited {result.returncode}:\n"
+            f"{result.stdout + result.stderr}"
+        )
+
+    if problems:
+        for problem in problems:
+            log(f"FAIL: {problem}")
+        sys.exit(1)
+    log("verify topology: PASS (dry-run roles/checks, fault, and recovery)")
+
+
+VERIFY_STAGES = {"foundation": verify_foundation, "topology": verify_topology}
+
+
+# --- faults -------------------------------------------------------------------
+
+
+def _addressed_links(interface):
+    """Links that configure addressing. MAAS represents a link-less interface
+    with a mode=link_up entry that still references the subnet; it assigns no
+    address and does not count as configuration."""
+    return [
+        ln for ln in interface.get("links", []) if ln.get("subnet") and ln.get("mode") != "link_up"
+    ]
+
+
+def fault_incomplete_config(args):
+    """Remove the subnet link from a node's boot interface via the MAAS API."""
+    if len(args) != 1:
+        fatal("usage: nt-testbed fault incomplete-config <hostname>")
+    hostname = args[0]
+    machines = maas_json("machines read")
+    machine = next((m for m in machines if m["hostname"] == hostname), None)
+    if machine is None:
+        fatal(f"no machine named {hostname}; have: {sorted(m['hostname'] for m in machines)}")
+    boot_id = (machine.get("boot_interface") or {}).get("id")
+    interface = next(i for i in machine["interface_set"] if i["id"] == boot_id)
+    removed = 0
+    for link in _addressed_links(interface):
+        maas_json(
+            f"interface unlink-subnet {machine['system_id']} {interface['id']} id={link['id']}"
+        )
+        removed += 1
+    if removed:
+        log(
+            f"fault injected: removed {removed} subnet link(s) from {hostname} {interface['name']}"
+        )
+    else:
+        log(f"{hostname} {interface['name']} already has no addressed subnet links")
+
+
+def clear_incomplete_config():
+    """Restore subnet links on any interface that lost them (from topology.yaml)."""
+    subnets = maas_json("subnets read")
+    pxe = next((s for s in subnets if s["cidr"] == PXE["cidr"]), None)
+    if pxe is None:
+        fatal(f"PXE subnet {PXE['cidr']} not found in MAAS")
+    for machine in maas_json("machines read"):
+        for interface in machine["interface_set"]:
+            if not interface.get("vlan"):
+                continue
+            if _addressed_links(interface):
+                continue
+            maas_json(
+                f"interface link-subnet {machine['system_id']} "
+                f"{interface['id']} mode=AUTO subnet={pxe['id']}"
+            )
+            log(
+                f"fault cleared: restored subnet link on {machine['hostname']} {interface['name']}"
+            )
+
+
+FAULTS = {"incomplete-config": fault_incomplete_config}
+CLEAR_FUNCS = [clear_incomplete_config]
+
+
+def clear_faults():
+    for clear in CLEAR_FUNCS:
+        clear()
 
 
 def cmd_fault(name, args):
     if name == "clear":
-        log("no faults defined in this stage; nothing to clear")
+        clear_faults()
+        log("fault state restored from topology.yaml")
         return
     if name not in FAULTS:
-        fatal(f"unknown fault '{name}'; available: {sorted(FAULTS) or 'none yet'}")
-    FAULTS[name](*args)
+        fatal(f"unknown fault '{name}'; available: {', '.join(sorted(FAULTS))}")
+    FAULTS[name](args)
 
 
 def main():
