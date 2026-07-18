@@ -81,6 +81,7 @@ def derive_peer_sets(topology, node):
             "interface": interface["name"],
             "mac": interface["mac"].lower(),
             "own_macs": _interface_macs(interface),
+            "gateway": interface.get("gateway_ip"),
             "expected": [],
             "out_of_scope": {},
             "forbidden": {},
@@ -376,6 +377,18 @@ def run(topology, node, section, cancellation):
                         "interface": plan["interface"],
                         "peer_system_id": peer["system_id"],
                         "peer_mac": mac,
+                        "skipped": True,
+                    }
+                )
+            elif plan.get("gateway") and ip == plan["gateway"]:
+                # The data-fabric subnet gateway (the ToR/FRR router since
+                # stage 7) is expected infrastructure, not an unexpected host.
+                section["observations"].append(
+                    {
+                        "type": "infrastructure-gateway-observed",
+                        "interface": plan["interface"],
+                        "ip": ip,
+                        "mac": mac,
                         "skipped": True,
                     }
                 )

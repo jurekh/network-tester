@@ -261,3 +261,20 @@ def test_parse_arp_pcap_extracts_sender_mac_and_ip():
 def test_parse_arp_pcap_tolerates_garbage():
     assert vlan.parse_arp_pcap(b"") == []
     assert vlan.parse_arp_pcap(b"\x00" * 10) == []
+
+
+# --- data-fabric gateway exclusion (stage 7) ---------------------------------------
+
+
+def test_data_gateway_mac_is_infrastructure_not_unexpected(fake_tools):
+    # the data subnet gateway (FRR ToR) appears in ARP capture; it is expected
+    # infrastructure, not an unexpected L2 neighbor
+    gw_ip = NODE["interfaces"][0].get("gateway_ip")
+    assert gw_ip  # the node-under-test's data interface carries a gateway
+    fake_tools["arp"][PEER_IP] = True
+    fake_tools["ping3"][PEER_IP] = PING_OK
+    fake_tools["capture"] = arp_pcap(("52:54:00:ff:ff:fe", gw_ip))
+    section = run_validator(fake=fake_tools)
+    assert "unexpected-l2-neighbor" not in finding_types(section)
+    infra = [o for o in section["observations"] if o["type"] == "infrastructure-gateway-observed"]
+    assert len(infra) == 1 and infra[0]["ip"] == gw_ip

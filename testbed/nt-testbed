@@ -54,6 +54,7 @@ def all_racks():
     """Rack names present in the topology, rack-1 first."""
     return list(CONFIG["racks"].keys())
 
+
 SYNC_EXCLUDES = [
     ".git",
     ".venv",
@@ -583,11 +584,23 @@ def ensure_vlan_networks():
     log("management VLAN networks configured (802.1q subinterfaces, subnets, DHCP)")
 
 
+def _data_vlans():
+    """(rack, vlan_name, vlan_cfg) for every controller-less data VLAN."""
+    out = [("rack-1", n, v) for n, v in VLANS.items() if not v.get("management")]
+    if RACK2 is not None:
+        out += [("rack-2", n, v) for n, v in RACK2["vlans"].items() if not v.get("management")]
+    return out
+
+
 def ensure_data_segments():
-    """Model controller-less VLANs (the data fabric) explicitly in MAAS."""
-    for name, vlan in VLANS.items():
-        if vlan.get("management"):
-            continue
+    """Model controller-less data VLANs in MAAS, with the FRR ToR as gateway.
+
+    Each data subnet's gateway_ip is the rack's FRR router (stage 7) so the
+    topology JSON carries it and cross-rack traffic routes by BGP. Same-rack
+    L2 neighbor checks are unaffected; the vlan-validator treats the gateway
+    as infrastructure.
+    """
+    for rack, name, vlan in _data_vlans():
         fabric_name = vlan["fabric"]
         fabric = next((f for f in maas_json("fabrics read") if f["name"] == fabric_name), None)
         if fabric is None:
@@ -598,12 +611,245 @@ def ensure_data_segments():
         )
         if mvlan is None:
             mvlan = maas_json(f"vlans create {fabric['id']} vid={vlan['tag']} name={name}")
+        gw = vlan.get("gateway")
         subnet = next((s for s in maas_json("subnets read") if s["cidr"] == vlan["cidr"]), None)
         if subnet is None:
             log(f"creating MAAS subnet {vlan['cidr']} on fabric {fabric_name}")
-            maas_json(f"subnets create cidr={vlan['cidr']} vlan={mvlan['id']}")
-        elif subnet["vlan"]["id"] != mvlan["id"]:
-            maas_json(f"subnet update {subnet['id']} vlan={mvlan['id']}")
+            args = f"cidr={vlan['cidr']} vlan={mvlan['id']}"
+            if gw:
+                args += f" gateway_ip={gw}"
+            maas_json(f"subnets create {args}")
+        else:
+            if subnet["vlan"]["id"] != mvlan["id"]:
+                maas_json(f"subnet update {subnet['id']} vlan={mvlan['id']}")
+            if gw and subnet.get("gateway_ip") != gw:
+                maas_json(f"subnet update {subnet['id']} gateway_ip={gw}")
+
+
+# --- rack 2 (stage 7) --------------------------------------------------------
+
+
+def _ctrl_ip(gateway):
+    """Rack-2 controller's address on a segment: the gateway's .2 host."""
+    return gateway.rsplit(".", 1)[0] + ".2"
+
+
+def ensure_rack2_bridge():
+    """OVS bridge br-rack2 for rack 2; the testbed VM owns the rack-2 gateways.
+
+    The testbed VM is the single router for both racks (management/PXE): it
+    owns the rack-2 PXE gateway on the untagged bridge and the rack-2 mgmt
+    gateway on an 802.1q subinterface, NATs rack-2 traffic out, and forwards
+    between racks so MAAS and the Juju controller reach rack-2 over routed
+    management, independent of the data fabric.
+    """
+    if RACK2 is None:
+        return
+    bridge = RACK2["bridge"]
+    vm_run(f"ovs-vsctl --may-exist add-br {bridge}")
+    pxe = RACK2["pxe"]
+    prefix = pxe["cidr"].split("/")[1]
+    vm_run(f"ip addr replace {pxe['gateway']}/{prefix} dev {bridge} && ip link set {bridge} up")
+    nets = [pxe["cidr"]]
+    for vlan in RACK2["vlans"].values():
+        if vlan.get("management"):
+            dev = f"{bridge}.{vlan['tag']}"
+            vprefix = vlan["cidr"].split("/")[1]
+            vm_run(
+                f"ip link show {dev} >/dev/null 2>&1 || "
+                f"ip link add link {bridge} name {dev} type vlan id {vlan['tag']}"
+            )
+            vm_run(
+                f"ip addr replace {vlan['gateway']}/{vprefix} dev {dev} && ip link set {dev} up"
+            )
+        nets.append(vlan["cidr"])
+    vm_run("sysctl -qw net.ipv4.ip_forward=1")
+    for cidr in nets:
+        vm_run(
+            f"iptables -t nat -C POSTROUTING -s {cidr} ! -d {cidr} -j MASQUERADE 2>/dev/null"
+            f" || iptables -t nat -A POSTROUTING -s {cidr} ! -d {cidr} -j MASQUERADE"
+        )
+        _ensure_forward(cidr)
+    log(f"OVS bridge {bridge} up; rack-2 gateways and NAT configured")
+
+
+def ensure_rack2_controller():
+    """Stand up the rack-2 MAAS rack controller as a system container.
+
+    A second registered rackd is what makes MAAS derive a distinct rack for
+    rack-2 nodes (the fetcher reads each node's boot-VLAN primary rack
+    controller). The container trunks br-rack2: untagged PXE plus an 802.1q
+    mgmt subinterface, mirroring the region's presence on br-rack1.
+    """
+    if RACK2 is None:
+        return
+    name = RACK2["controller"]
+    if not vm_ok(f"lxc info {name} >/dev/null 2>&1"):
+        log(f"launching rack-2 controller container {name}")
+        vm_run(f"lxc launch ubuntu:24.04 {name} -c security.nesting=true")
+        wait_for(
+            f"{name} agent",
+            lambda: vm_ok(f"lxc exec {name} -- true"),
+            timeout=120,
+            interval=5,
+        )
+        vm_run(f"lxc config device add {name} trunk nic nictype=bridged parent={RACK2['bridge']}")
+    pxe = RACK2["pxe"]
+    mgmt = RACK2["vlans"]["mgmt"]
+    pxe_ip, mgmt_ip = _ctrl_ip(pxe["gateway"]), _ctrl_ip(mgmt["gateway"])
+    setup = (
+        f"ip addr replace {pxe_ip}/{pxe['cidr'].split('/')[1]} dev eth1; ip link set eth1 up; "
+        f"ip link show eth1.{mgmt['tag']} >/dev/null 2>&1 || "
+        f"ip link add link eth1 name eth1.{mgmt['tag']} type vlan id {mgmt['tag']}; "
+        f"ip addr replace {mgmt_ip}/{mgmt['cidr'].split('/')[1]} dev eth1.{mgmt['tag']}; "
+        f"ip link set eth1.{mgmt['tag']} up; "
+        f"ip route replace default via {pxe['gateway']}; "
+        f"echo 'nameserver {PXE['gateway']}' > /etc/resolv.conf"
+    )
+    vm_run(f"lxc exec {name} -- bash -c {shlex.quote(setup)}")
+    if not vm_ok(f"lxc exec {name} -- snap list maas >/dev/null 2>&1"):
+        log(f"installing maas snap in {name}")
+        vm_run(f"lxc exec {name} -- snap install maas --channel={MAAS_CFG['channel']}")
+    rc_hostnames = {c["hostname"] for c in maas_json("rack-controllers read")}
+    if name not in rc_hostnames:
+        secret = vm_out("cat /var/snap/maas/common/maas/secret")
+        log(f"registering {name} as a rack controller")
+        vm_run(
+            f"lxc exec {name} -- maas init rack --maas-url {MAAS_URL} --secret {secret}",
+        )
+        wait_for(
+            f"{name} registration",
+            lambda: name in {c["hostname"] for c in maas_json("rack-controllers read")},
+            timeout=180,
+            interval=10,
+        )
+    log(f"rack-2 controller {name} registered")
+
+
+def ensure_rack2_networks():
+    """Model the rack-2 management VLAN and enable DHCP via the rack-2 controller.
+
+    Mirrors ensure_vlan_networks for rack 2: create the fabric/VLAN/subnet,
+    wait for the rack-2 controller's subinterface discovery, then enable DHCP
+    with the rack-2 controller as primary rack so its nodes derive rack-2.
+    """
+    if RACK2 is None:
+        return
+    name = RACK2["controller"]
+    rc = next((c for c in maas_json("rack-controllers read") if c["hostname"] == name), None)
+    if rc is None:
+        fatal(f"rack-2 controller {name} not registered")
+    rack_id = rc["system_id"]
+    mgmt = RACK2["vlans"]["mgmt"]
+    _fabric, mvlan = _maas_vlan_for(mgmt["fabric"], mgmt["tag"], "mgmt-r2")
+    subnet = next((s for s in maas_json("subnets read") if s["cidr"] == mgmt["cidr"]), None)
+    if subnet is None:
+        log(f"creating MAAS subnet {mgmt['cidr']} for rack-2 mgmt")
+        maas_json(
+            f"subnets create cidr={mgmt['cidr']} vlan={mvlan['id']} gateway_ip={mgmt['gateway']}"
+        )
+    elif subnet["vlan"]["id"] != mvlan["id"]:
+        maas_json(f"subnet update {subnet['id']} vlan={mvlan['id']} gateway_ip={mgmt['gateway']}")
+
+    dev = f"eth1.{mgmt['tag']}"
+    wait_for(
+        f"{name} mgmt interface discovery",
+        lambda: _rc_vlan_iface(rack_id, dev) is not None,
+        timeout=300,
+        interval=15,
+    )
+    rng = mgmt.get("dhcp_range")
+    ranges = maas_json("ipranges read")
+    if rng and not any(r["start_ip"] == rng["start"] for r in ranges):
+        log(f"creating rack-2 mgmt DHCP range {rng['start']}-{rng['end']}")
+        maas_json(f"ipranges create type=dynamic start_ip={rng['start']} end_ip={rng['end']}")
+    iface = _rc_vlan_iface(rack_id, dev)
+    vlan = iface["vlan"]
+    if not vlan["dhcp_on"]:
+        log(f"enabling MAAS DHCP on rack-2 mgmt (primary_rack={name})")
+        maas_json(
+            f"vlan update {vlan['fabric_id']} {vlan['vid']} dhcp_on=true primary_rack={rack_id}"
+        )
+    log("rack-2 management VLAN configured with DHCP")
+
+
+FRR_LINK_NET = "nt-interrack"
+
+
+def _frr_data_dev(rack):
+    return f"frr-{rack}-data"
+
+
+def ensure_frr_routers():
+    """Create one FRR ToR container per rack with eBGP over an inter-rack link.
+
+    Each router owns its rack's data subnet gateway and an inter-rack /30
+    address; eBGP (redistribute connected) advertises each rack's data subnet
+    to the other so cross-rack data traffic routes by BGP.
+    """
+    if ROUTERS is None:
+        return
+    vm_run(
+        f"lxc network show {FRR_LINK_NET} >/dev/null 2>&1 || "
+        f"lxc network create {FRR_LINK_NET} ipv4.address=none ipv6.address=none"
+    )
+    rack_bridge = {"rack-1": PXE["bridge"], "rack-2": RACK2["bridge"] if RACK2 else None}
+    data_tag = {
+        "rack-1": VLANS["data"]["tag"],
+        "rack-2": RACK2["vlans"]["data"]["tag"] if RACK2 else None,
+    }
+    for rack, cfg in ((r, ROUTERS[r]) for r in ("rack-1", "rack-2") if r in ROUTERS):
+        host = cfg["name"]
+        if not vm_ok(f"lxc info {host} >/dev/null 2>&1"):
+            log(f"launching FRR router {host} for {rack}")
+            vm_run(f"lxc launch ubuntu:24.04 {host} -c security.nesting=true")
+            wait_for(f"{host} agent", lambda h=host: vm_ok(f"lxc exec {h} -- true"), 120, 5)
+            vm_run(
+                f"lxc config device add {host} data nic nictype=bridged "
+                f"parent={rack_bridge[rack]} vlan={data_tag[rack]}"
+            )
+            vm_run(f"lxc config device add {host} link nic nictype=bridged parent={FRR_LINK_NET}")
+        data_prefix = (
+            VLANS["data"]["cidr"].split("/")[1]
+            if rack == "rack-1"
+            else RACK2["vlans"]["data"]["cidr"].split("/")[1]
+        )
+        link_cidr = ROUTERS["inter_rack_cidr"].split("/")[1]
+        setup = (
+            f"ip addr replace {cfg['data_ip']}/{data_prefix} dev eth1; ip link set eth1 up; "
+            f"ip addr replace {cfg['link_ip']}/{link_cidr} dev eth2; ip link set eth2 up; "
+            f"sysctl -qw net.ipv4.ip_forward=1"
+        )
+        vm_run(f"lxc exec {host} -- bash -c {shlex.quote(setup)}")
+        if not vm_ok(f"lxc exec {host} -- which vtysh >/dev/null 2>&1"):
+            log(f"installing FRR in {host}")
+            vm_run(
+                f"lxc exec {host} -- bash -c "
+                f"'export DEBIAN_FRONTEND=noninteractive; apt-get update -q >/dev/null 2>&1; "
+                f"apt-get install -qy frr >/dev/null 2>&1'"
+            )
+            vm_run(f"lxc exec {host} -- sed -i 's/^bgpd=no/bgpd=yes/' /etc/frr/daemons")
+            vm_run(f"lxc exec {host} -- systemctl restart frr")
+    _configure_ebgp()
+    log("FRR ToR routers up with eBGP")
+
+
+def _configure_ebgp():
+    pairs = {"rack-1": "rack-2", "rack-2": "rack-1"}
+    for rack, peer in pairs.items():
+        if rack not in ROUTERS or peer not in ROUTERS:
+            continue
+        cfg, peer_cfg = ROUTERS[rack], ROUTERS[peer]
+        cmds = (
+            "conf t",
+            f"router bgp {cfg['asn']}",
+            f"neighbor {peer_cfg['link_ip']} remote-as {peer_cfg['asn']}",
+            "redistribute connected",
+            "end",
+            "write memory",
+        )
+        vtysh = " ".join(f"-c {shlex.quote(c)}" for c in cmds)
+        vm_run(f"lxc exec {cfg['name']} -- vtysh {vtysh}", check=False)
 
 
 def set_nic_vlan(host, device, tag):
@@ -631,6 +877,18 @@ def ensure_node_networking():
         names = sorted(devices)
         changed = False
         boot_dev = names[0]
+        # Rack-2 nodes compose on br-rack1 (the inner LXD default profile) and
+        # must move their boot NIC to br-rack2 so they commission via the
+        # rack-2 controller and MAAS derives rack 2.
+        boot_bridge = nics_cfg[0].get("bridge", bridge)
+        have_parent = devices[boot_dev].get("parent") or devices[boot_dev].get("network")
+        if have_parent != boot_bridge:
+            log(f"{host}: moving boot NIC {boot_dev} to {boot_bridge}")
+            vm_run(
+                f"lxc config device set {host} {boot_dev} nictype=bridged parent={boot_bridge}",
+                check=False,
+            )
+            changed = True
         want_tag = vlans[nics_cfg[0]["vlan"]]["tag"] if nics_cfg[0].get("vlan") else None
         have_tag = devices[boot_dev].get("vlan")
         if want_tag is not None and str(want_tag) != str(have_tag or ""):
@@ -1108,6 +1366,7 @@ def cmd_up():
     ensure_vm()
     ensure_packages()
     ensure_bridge()
+    ensure_rack2_bridge()
     ensure_maas()
     ensure_subnet_dhcp()
     ensure_images()
@@ -1118,6 +1377,9 @@ def cmd_up():
     ensure_dhcp_rebind()
     ensure_data_segments()
     ensure_inner_lxd()
+    ensure_rack2_controller()
+    ensure_rack2_networks()
+    ensure_frr_routers()
     ensure_vm_host()
     ensure_machines()
     ensure_node_networking()
@@ -1654,12 +1916,138 @@ def verify_bond():
     log("verify bond: PASS (clean LACP, bond-static, bond-passive, bond-swap)")
 
 
+def _bgp_passes(report):
+    return [e for e in report.get("passed_checks", []) if e["type"] == "bgp-reachability"]
+
+
+def _mtu_observations(report):
+    return [
+        o
+        for o in report.get("observations", [])
+        if o["type"] == "cross-rack-mtu" and o.get("observed_path_mtu_bytes")
+    ]
+
+
+def verify_multirack():
+    """Stage 7 gate: clean cross-rack run plus bgp-down, mtu, rep-wrong-vlan."""
+    charm_name = ensure_charm_packed()
+    sync_tree()
+    ensure_juju()
+    destroy_test_models()
+    clear_faults()
+    problems = []
+    deploy_args = f"--charm charm/{charm_name} --cloud {MAAS_CLOUD} --wait-timeout 2400"
+
+    log("verify multirack: clean run (model kept for fault re-triggers)")
+    result = network_tester_run(f"--all --keep-model --verbose {deploy_args}")
+    output = result.stdout + result.stderr
+    match = re.search(r"Model (network-test-\S+) kept", output)
+    report = report_from_output(output)
+    model = match.group(1) if match else None
+    if model is None or report is None:
+        problems.append(f"clean run failed ({result.returncode}):\n{output}")
+    else:
+        if report["definitive_failures"] or report["inferred_failures"]:
+            problems.append(
+                "clean run has failures:\n"
+                + json.dumps(report["definitive_failures"] + report["inferred_failures"], indent=2)
+            )
+        if len(_bgp_passes(report)) < 2:
+            problems.append(
+                f"clean run: expected cross-rack BGP reachable both directions, got "
+                f"{len(_bgp_passes(report))} passes"
+            )
+        mtus = [o["observed_path_mtu_bytes"] for o in _mtu_observations(report)]
+        if not mtus:
+            problems.append("clean run: no cross-rack MTU observations")
+        elif not all(1400 <= m <= 1600 for m in mtus):
+            problems.append(f"clean run: MTU observations not ~1500: {mtus}")
+
+    if not problems and model:
+        problems += _verify_multirack_faults(model)
+
+    if model:
+        log("verify multirack: destroying kept model")
+        vm_run(f"juju destroy-model --no-prompt --force --timeout 15m {model}", check=False)
+        wait_nodes_ready()
+
+    if problems:
+        for problem in problems:
+            log(f"FAIL: {problem}")
+        sys.exit(1)
+    log("verify multirack: PASS (clean cross-rack, bgp-down, mtu, rep-wrong-vlan)")
+
+
+def _verify_multirack_faults(model):
+    problems = []
+
+    log("verify multirack: bgp-down fault")
+    cmd_fault("bgp-down", [])
+    rep = report_from_output(
+        (network_tester_run(f"--reuse-model {model} --wait-timeout 1200").stdout or "")
+    )
+    if rep is None:
+        problems.append("bgp-down: no report")
+    else:
+        inferred = rep["inferred_failures"]
+        tor = [f for f in inferred if f.get("type") == "likely-bgp-failure"]
+        if len(inferred) != 1 or not tor:
+            problems.append(
+                "bgp-down: expected one inferred likely-bgp-failure rack-pair entry:\n"
+                + json.dumps(inferred, indent=2)
+            )
+    clear_faults()
+
+    log("verify multirack: mtu 1400 fault")
+    cmd_fault("mtu", ["1400"])
+    rep = report_from_output(
+        (network_tester_run(f"--reuse-model {model} --wait-timeout 1200").stdout or "")
+    )
+    if rep is None:
+        problems.append("mtu: no report")
+    else:
+        mtus = [o["observed_path_mtu_bytes"] for o in _mtu_observations(rep)]
+        if not mtus or not all(m == 1400 for m in mtus):
+            problems.append(f"mtu 1400: expected 1400 observations both directions, got {mtus}")
+    clear_faults()
+
+    log("verify multirack: rep-wrong-vlan fault")
+    cmd_fault("rep-wrong-vlan", [])
+    rep = report_from_output(
+        (network_tester_run(f"--reuse-model {model} --wait-timeout 1200").stdout or "")
+    )
+    if rep is None:
+        problems.append("rep-wrong-vlan: no report")
+    else:
+        gated = [
+            e
+            for e in rep["inconclusive_checks"]
+            if e["type"] == "bgp-reachability" and "phase-1 failure" in e.get("note", "")
+        ]
+        target_warn = [
+            w for w in rep["warnings"] if w["type"] == "target-representative-unhealthy"
+        ]
+        if not gated:
+            problems.append(
+                "rep-wrong-vlan: expected rack-1 outbound BGP gated to inconclusive:\n"
+                + json.dumps(rep["inconclusive_checks"], indent=2)
+            )
+        if not target_warn:
+            problems.append(
+                "rep-wrong-vlan: expected reverse-direction target-node warning:\n"
+                + json.dumps(rep["warnings"], indent=2)
+            )
+    clear_faults()
+    return problems
+
+
 VERIFY_STAGES = {
     "foundation": verify_foundation,
     "topology": verify_topology,
     "skeleton": verify_skeleton,
     "vlan": verify_vlan,
     "bond": verify_bond,
+    "multirack": verify_multirack,
 }
 
 
@@ -1882,14 +2270,126 @@ def clear_bond():
     vm_run(f"rm -f {BOND_PAUSE_FLAG}", check=False)
 
 
+def fault_bgp_down(args):
+    """Shut down the rack-1 ToR's eBGP session toward rack 2 (likely-bgp-failure)."""
+    if ROUTERS is None:
+        fatal("no routers configured (single-rack topology)")
+    cfg, peer = ROUTERS["rack-1"], ROUTERS["rack-2"]
+    vtysh = " ".join(
+        f"-c {shlex.quote(c)}"
+        for c in (
+            "conf t",
+            f"router bgp {cfg['asn']}",
+            f"neighbor {peer['link_ip']} shutdown",
+            "end",
+            "write memory",
+        )
+    )
+    vm_run(f"lxc exec {cfg['name']} -- vtysh {vtysh}")
+    log(f"fault injected: {cfg['name']} eBGP neighbor {peer['link_ip']} shut down")
+
+
+def clear_bgp_down():
+    if ROUTERS is None:
+        return
+    cfg, peer = ROUTERS["rack-1"], ROUTERS["rack-2"]
+    if not vm_ok(f"lxc info {cfg['name']} >/dev/null 2>&1"):
+        return
+    vtysh = " ".join(
+        f"-c {shlex.quote(c)}"
+        for c in (
+            "conf t",
+            f"router bgp {cfg['asn']}",
+            f"no neighbor {peer['link_ip']} shutdown",
+            "end",
+            "write memory",
+        )
+    )
+    vm_run(f"lxc exec {cfg['name']} -- vtysh {vtysh}", check=False)
+
+
+def fault_mtu(args):
+    """Set the inter-rack link MTU on both ToR routers (default 1400)."""
+    if ROUTERS is None:
+        fatal("no routers configured (single-rack topology)")
+    mtu = args[0] if args else "1400"
+    for rack in ("rack-1", "rack-2"):
+        vm_run(f"lxc exec {ROUTERS[rack]['name']} -- ip link set eth2 mtu {mtu}")
+    log(f"fault injected: inter-rack link MTU set to {mtu} on both ToRs")
+
+
+def clear_mtu():
+    if ROUTERS is None:
+        return
+    for rack in ("rack-1", "rack-2"):
+        if vm_ok(f"lxc info {ROUTERS[rack]['name']} >/dev/null 2>&1"):
+            vm_run(f"lxc exec {ROUTERS[rack]['name']} -- ip link set eth2 mtu 1500", check=False)
+
+
+def _rack1_representative_host():
+    """Hostname of rack 1's deterministic representative (lowest data system_id)."""
+    rack1_data = {
+        n["hostname"]
+        for n in expected_nodes()
+        if n.get("rack") == "rack-1" and n.get("role") == "data"
+    }
+    machines = maas_json("machines read")
+    candidates = sorted(
+        (m["system_id"], m["hostname"]) for m in machines if m["hostname"] in rack1_data
+    )
+    if not candidates:
+        fatal("no rack-1 data nodes found for rep-wrong-vlan")
+    return candidates[0][1]
+
+
+REP_WRONG_TAG = 777
+
+
+def fault_rep_wrong_vlan(args):
+    """Retag the rack-1 representative's data bond onto a stray VLAN.
+
+    This isolates the representative on the data fabric, so its vlan-validator
+    records a definitive missing-l2-neighbor (a phase-1 failure on a rep),
+    which the report-generator uses to gate that rack's outbound cross-rack
+    findings to inconclusive.
+    """
+    if RACK2 is None:
+        fatal("rep-wrong-vlan requires the multirack topology")
+    rep_host = _rack1_representative_host()
+    _pause_reconciler()
+    vm_run(f"ovs-vsctl set port {ovs_bond_name(rep_host)} tag={REP_WRONG_TAG}")
+    log(f"fault injected: rack-1 representative {rep_host} data bond retagged to {REP_WRONG_TAG}")
+
+
+def clear_rep_wrong_vlan():
+    if RACK2 is None:
+        return
+    data_tag = VLANS["data"]["tag"]
+    for node in expected_nodes():
+        if node.get("rack") == "rack-1" and node_bond(node):
+            name = ovs_bond_name(node["hostname"])
+            vm_run(f"ovs-vsctl --if-exists set port {name} tag={data_tag}", check=False)
+    vm_run(f"rm -f {BOND_PAUSE_FLAG}", check=False)
+
+
 FAULTS = {
     "incomplete-config": fault_incomplete_config,
     "wrong-vlan": fault_wrong_vlan,
     "bond-static": fault_bond_static,
     "bond-passive": fault_bond_passive,
     "bond-swap": fault_bond_swap,
+    "bgp-down": fault_bgp_down,
+    "mtu": fault_mtu,
+    "rep-wrong-vlan": fault_rep_wrong_vlan,
 }
-CLEAR_FUNCS = [clear_wrong_vlan, clear_bond, clear_incomplete_config]
+CLEAR_FUNCS = [
+    clear_wrong_vlan,
+    clear_bond,
+    clear_bgp_down,
+    clear_mtu,
+    clear_rep_wrong_vlan,
+    clear_incomplete_config,
+]
 
 
 def clear_faults():
