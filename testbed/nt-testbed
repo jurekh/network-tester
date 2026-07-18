@@ -469,15 +469,28 @@ def ensure_images():
         interval=30,
     )
 
-    def rack_synced():
+    def rack_reports_images():
+        # Rack controllers do not sync boot images; they proxy and cache them
+        # from the region on demand (only region controllers replicate images,
+        # and only in HA/multi-region setups). This only confirms the rack
+        # controller endpoint is up and can see the region's boot resources.
+        # The list-boot-images API is deprecated and returns a hardcoded
+        # status: synced, so this is a liveness check, not a sync wait.
         racks = maas_json("rack-controllers read")
         images = maas_json(
             f"rack-controller list-boot-images {racks[0]['system_id']}", check=False
         )
         return images is not None and images.get("status") == "synced"
 
-    wait_for("rack controller image sync", rack_synced, timeout=900, interval=20)
-    log("boot images imported and synced to the rack controller")
+    wait_for(
+        "rack controller to report region boot images",
+        rack_reports_images,
+        timeout=900,
+        interval=20,
+    )
+    log(
+        "region boot images imported; rack controllers proxy and cache them from the region on demand"
+    )
 
 
 def ensure_inner_lxd():
