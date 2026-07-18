@@ -1,0 +1,34 @@
+# CI tier 3 (see testbed/README.md "CI tiers"): the full nested-virt testbed
+# verify matrix. Runs nightly and on demand. Requires a self-hosted runner with
+# /dev/kvm and nested KVM enabled (GitHub-hosted runners do not provide nested
+# virtualization), ~28 GB RAM and ~100 GB free disk, LXD initialised, and uv.
+name: Testbed verify matrix (tier 3)
+
+on:
+  schedule:
+    - cron: "0 3 * * *"   # nightly at 03:00 UTC
+  workflow_dispatch:       # manual / on-demand
+
+jobs:
+  testbed-verify:
+    name: Tier 3 - testbed verify matrix
+    runs-on: [self-hosted, nested-virt]
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Preflight - nested KVM available
+        run: |
+          test -e /dev/kvm
+          grep -qx Y /sys/module/kvm_*/parameters/nested
+      - name: Bring up the testbed
+        run: testbed/nt-testbed up
+      - name: Verify matrix
+        run: |
+          for stage in foundation topology skeleton vlan bond multirack timeout scale; do
+            echo "::group::verify $stage"
+            testbed/nt-testbed verify "$stage"
+            echo "::endgroup::"
+          done
+      - name: Tear down
+        if: always()
+        run: testbed/nt-testbed down

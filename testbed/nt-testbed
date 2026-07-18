@@ -2454,18 +2454,13 @@ def verify_scale():
         out = result.stdout + result.stderr
         if result.returncode != 0 or "DEPLOY-OK" not in out:
             problems.append(
-                f"libjuju deploy of the {size}-byte 200-node topology resource "
-                f"failed:\n{out}"
+                f"libjuju deploy of the {size}-byte 200-node topology resource failed:\n{out}"
             )
         else:
-            resource_line = next(
-                (l for l in out.splitlines() if l.startswith("RESOURCES:")), ""
-            )
+            resource_line = next((l for l in out.splitlines() if l.startswith("RESOURCES:")), "")
             names = resource_line.partition(":")[2].split(",")
             if "topology" not in [n.strip() for n in names]:
-                problems.append(
-                    f"topology resource not registered after deploy:\n{out}"
-                )
+                problems.append(f"topology resource not registered after deploy:\n{out}")
     finally:
         vm_run(
             f"juju destroy-model --no-prompt --force --timeout 5m {model}",

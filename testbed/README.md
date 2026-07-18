@@ -11,6 +11,52 @@ injection cannot sever Juju connectivity. The testbed VM also plays the
 operator-workstation role: the working tree is synced into it and the
 network-tester CLI runs from there.
 
+## Topology
+
+Everything below runs inside the single `nt-testbed` outer VM. `[F:name]`
+marks where `fault <name>` injects a fault.
+
+```
+                          nt-testbed outer LXD VM
+ +-------------------------------------------------------------------------+
+ |                                                                         |
+ |  MAAS region+rack (region API :5240)        Juju controller (inner LXD) |
+ |        |                                            |                   |
+ |   br-pxe / mgmt+PXE bridge  <------- control plane (MAAS + Juju) -------+
+ |        |  (rack-1 boot NICs tagged to mgmt VLAN after commission;       |
+ |        |   rack-2 boot NICs on br-rack2 PXE access VLAN 99)             |
+ |        |                                                                |
+ |   =========================== RACK 1 ===========================        |
+ |   br-rack1 (OVS = ToR switch)                                           |
+ |     | data VLAN 100                                                     |
+ |     +-- r1-data-01  bond0 (802.3ad, lacp slow) [F:bond-static]          |
+ |     |                                          [F:bond-passive]         |
+ |     |                                          [F:bond-swap]            |
+ |     |                            data NIC      [F:wrong-vlan]           |
+ |     |                            boot subnet   [F:incomplete-config]    |
+ |     +-- r1-data-02  bond0 (representative)      [F:rep-wrong-vlan]      |
+ |     +-- r1-oam-01   (bmc-oam)                                           |
+ |     |                                                                   |
+ |   frr-rack1 (ToR router, gw 10.100.2.254, ASN 65001)                    |
+ |        |                                                                |
+ |        |  inter-rack /30 10.100.5.0/30, eBGP 65001<->65002             |
+ |        |                                          [F:bgp-down] (rack-1) |
+ |        |                                          [F:mtu] (both ends)   |
+ |   frr-rack2 (ToR router, gw 10.100.6.254, ASN 65002)                    |
+ |     |                                                                   |
+ |   =========================== RACK 2 ===========================        |
+ |   br-rack2 (OVS = ToR switch)   nt-rack2 (rack-2 MAAS rack controller)  |
+ |     | data VLAN 100 / PXE access VLAN 99                                |
+ |     +-- r2-data-01  bond0 (802.3ad, lacp slow)                         |
+ |     +-- r2-data-02  bond0                                               |
+ |                                                                         |
+ +-------------------------------------------------------------------------+
+```
+
+Management/PXE traffic between racks routes statically via the testbed VM, so
+MAAS and Juju connectivity stay independent of the data-fabric BGP routing
+that the `bgp-down` / `mtu` faults disrupt.
+
 ## Host prerequisites
 
 - LXD installed and initialised (`lxc` usable by your user)
@@ -227,3 +273,49 @@ machines are provisioned. The size unit test (`tests/test_scale_limits.py`)
 records the resource and action-result byte budgets and the conclusion that no
 chunking or compression is needed: the action result is per-unit and bounded
 by rack count (representative sampling), not by node count.
+
+## verify matrix
+
+| Stage | What it asserts | Faults exercised | Needs MAAS deploy |
+|-------|-----------------|------------------|-------------------|
+| `foundation` | composed machines reach `Ready` | - | no |
+| `topology` | dry-run + pre-flight round-trip | `incomplete-config` | no |
+| `skeleton` | full deploy/probe/collect/report; model auto-destroy; reuse | - | yes |
+| `vlan` | VLAN neighbor sets | `wrong-vlan` | yes |
+| `bond` | LACP capture in the 35s window; bond findings | `bond-static`, `bond-passive`, `bond-swap` | yes |
+| `multirack` | cross-rack MTU + BGP inference; fault reconciliation | `bgp-down`, `mtu`, `rep-wrong-vlan` | yes |
+| `timeout` | low `probe-timeout` -> partial timeout output, inconclusive cross-rack | - | yes |
+| `scale` | Juju accepts a 200-node topology resource (0 units) | - | no (0 units) |
+
+## CI tiers
+
+The testbed is split into tiers by cost and required runner capability so most
+changes get fast feedback and the expensive nested-virt matrix runs on demand:
+
+- **Tier 1 - unit/integration (every change).** `make lint test`: ruff
+  lint/format, the CLI/unit tests (`tests/`), and the charm unit tests
+  (`charm/tests/unit`). Runs on any standard runner in seconds to low minutes;
+  no virtualization needed. This is the required gate on every push/PR.
+- **Tier 2 - jubilant charm integration (every change, LXD-capable runner).**
+  The charm's jubilant integration test deploys the charm to an LXD-backed
+  Juju model (no MAAS). Needs a runner with LXD and nested containers; runs in
+  minutes. Catches charm wiring (peer relation, config propagation,
+  collect-results) without the full fabric.
+- **Tier 3 - full testbed `verify` matrix (nightly or on demand, nested-virt
+  runner).** `nt-testbed up` then the `verify` stages above on a runner with
+  `/dev/kvm` and nested KVM (~28 GB RAM, ~100 GB disk; see Host prerequisites).
+  A clean multi-rack build plus the full matrix takes well over an hour, so it
+  is scheduled nightly or triggered manually, not per-change.
+
+Tier 1 is wired as `make lint test` / `make build` (see the repository
+`Makefile`). Tiers 2 and 3 require runners with the capabilities above; wire
+them as scheduled / manual jobs on infrastructure that provides LXD
+(tier 2) and nested KVM (tier 3).
+
+## Real-hardware validation
+
+The testbed emulates switches with OVS, which is faithful for the negotiated
+LACP/BGP/MTU results the validators read but is not real switch hardware. The
+real-hardware manual gate (a 2-rack MAAS deployment with an injected fault and
+a real switch bond on `lacp_rate slow`) is documented as an operator runbook in
+[`../docs/manual-hardware-runbook.md`](../docs/manual-hardware-runbook.md).

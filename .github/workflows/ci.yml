@@ -1,0 +1,45 @@
+# CI tiers 1 and 2 (see testbed/README.md "CI tiers").
+# Tier 1 (lint + unit/integration tests) runs on every push and PR.
+# Tier 2 (jubilant charm integration on an LXD-backed model) runs on every push
+# and PR on an LXD-capable runner.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tier1-lint-test:
+    name: Tier 1 - lint + unit/integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Lint
+        run: make lint
+      - name: Test
+        run: make test
+
+  tier2-jubilant:
+    name: Tier 2 - jubilant charm integration (LXD)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Set up LXD and Juju
+        uses: charmed-kubernetes/actions-operator@main
+        with:
+          provider: lxd
+          juju-channel: 3.6/stable
+      - name: Pack the charm
+        run: |
+          sudo snap install charmcraft --classic
+          cd charm && charmcraft pack
+      - name: Run jubilant integration tests
+        env:
+          CHARM_PATH: ${{ github.workspace }}/charm/network-tester_amd64.charm
+        run: |
+          cd charm
+          uv tool run --from tox tox -e integration
