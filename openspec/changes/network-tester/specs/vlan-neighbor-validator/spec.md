@@ -63,6 +63,13 @@ After the passive ARP capture phase completes, the vlan-neighbor-validator SHALL
 - **WHEN** passive ARP capture reveals an unexpected MAC X with IP Y, and `ping -c 1 -W 2 Y` times out
 - **THEN** the validator SHALL record only an `unexpected-l2-neighbor` finding; no `unexpected-reachability` failure is recorded
 
+### Requirement: Report execution status per the shared probe-output schema
+The `vlan_neighbor_validator` probe-output section SHALL include `validator_status` as defined by the shared probe-output schema: `complete` when probing and analysis finish, `timeout` or `cancelled` when interrupted by the probe-runner; the probe-runner writes `not_started` when the validator never ran. Completion SHALL be explicit; an empty findings list alone does not indicate success.
+
+#### Scenario: Completed run with no findings
+- **WHEN** the vlan-neighbor-validator finishes with no failures
+- **THEN** its probe-output section SHALL include `validator_status: "complete"`
+
 ### Requirement: Fall back to system ping if raw socket unavailable
 If raw ICMP socket creation fails due to insufficient privileges, the validator SHALL fall back to the system `ping` binary.
 

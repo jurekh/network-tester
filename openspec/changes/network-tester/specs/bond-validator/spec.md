@@ -12,11 +12,11 @@ The bond-validator SHALL capture LACP PDUs (EtherType 0x8809) on each physical m
 - **THEN** the validator SHALL record the interface as `lacp_advertised: false`, indicating the switch port is configured for static bonding or for passive LACP facing a passive host
 
 ### Requirement: Produce empty bond list when node has no bonded interfaces
-If a node has no bonded interfaces (e.g., a bmc-oam node or a data node with a single NIC), the bond-validator SHALL record `bonds: []` in the probe output and exit without failure. This keeps the output schema consistent for the report generator.
+If a node has no bonded interfaces (e.g., a bmc-oam node or a data node with a single NIC), the bond-validator SHALL record `validator_status: "complete"` with `bonds: []` in the probe output and exit without failure. This keeps the output schema consistent for the report generator.
 
 #### Scenario: Node with no bonded interfaces
 - **WHEN** `/proc/net/bonding/` contains no bond files
-- **THEN** the validator SHALL write `{"bonds": []}` to the probe output and exit with status 0
+- **THEN** the validator SHALL write `{"validator_status": "complete", "bonds": []}` to the probe output and exit with status 0
 
 ### Requirement: Detect bond mode mismatch between host configuration and switch behavior
 The bond-validator SHALL compare the host's configured bond mode (read from `/proc/net/bonding/<bond>` or `ip link`) against what the switch advertises via LACP PDUs. A mismatch SHALL be recorded as a failure with a remediation hint.
@@ -54,6 +54,13 @@ The bond-validator SHALL check that each physical member interface receives LACP
 #### Scenario: Both bond members receive PDUs from the same switch system ID
 - **WHEN** both eth0 and eth1 receive inbound LACP PDUs with the same actor system ID
 - **THEN** the validator SHALL record the bond as `bond_cabling: pass`
+
+### Requirement: Report execution status per the shared probe-output schema
+The `bond_validator` probe-output section SHALL include `validator_status` as defined by the shared probe-output schema: `complete` when capture and analysis finish (including the no-bonds case), `timeout` or `cancelled` when interrupted by the probe-runner; the probe-runner writes `not_started` when the validator never ran. Completion SHALL be explicit; an empty findings list alone does not indicate success.
+
+#### Scenario: Completed run with no findings
+- **WHEN** the bond-validator finishes with no failures
+- **THEN** its probe-output section SHALL include `validator_status: "complete"`
 
 ### Requirement: Record raw LACP PDU data in probe output for audit
 The bond-validator SHALL include the raw decoded LACP PDU fields in the probe output JSON alongside the pass/fail verdict, to allow manual review without re-running the tool.

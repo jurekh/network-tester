@@ -140,7 +140,7 @@ bond-validator (passive LACP capture) and vlan-neighbor-validator (ARP/ICMP) do 
 
 ### D14: Overall probe timeout enforced by probe-runner, not Juju
 
-The charm passes the `probe-timeout` config value (default 240s) to the payload at invocation. The probe-runner enforces this timeout: if it elapses before all validators complete, it terminates running validators, writes partial results with `status: timeout`, and exits. This ensures the charm unit returns to `active/idle` and `collect-results` can still retrieve partial output.
+The charm passes the `probe-timeout` config value (default 240s) to the payload at invocation. The probe-runner enforces this timeout: if it elapses before all validators complete, it terminates running validators, writes partial results with `status: timeout` (or `status: cancelled` on SIGTERM/operator cancellation) and explicit per-validator `validator_status` values, and exits. This ensures the charm unit returns to `active/idle` and `collect-results` can still retrieve partial output.
 
 The default is sized against per-command caps: phase 1 is bounded by the 35s LACP capture window and the 30s ARP passive-capture cap (concurrent). For non-representative data nodes the second phase is skipped. For each source-rack representative, MTU probing costs at most ~14s per remote rack representative (7 probes at 2s each), and BGP inference costs two 2s ICMP probes plus one 75s-capped traceroute per remote rack. This bounds second-phase work by rack count rather than node count, but large rack counts or many failed cross-rack paths can still exceed the default timeout. The timeout-budget test must calculate the expected wall-clock for the selected rack count; if it cannot fit under the default, implementation must either raise `probe-timeout` together with the Juju hook timeout, cap the number of remote rack probes per run, or report the remaining rack-pairs as inconclusive rather than silently overrunning. The default must stay below the Juju hook timeout (300s default) with margin for the 5s flush window, because the hook invoking the payload would otherwise be hard-killed without partial-result flushing; raising `probe-timeout` past that requires raising the hook timeout too.
 
@@ -157,7 +157,7 @@ Topology JSON, per-unit probe-output JSON, and final report JSON are contracts b
 
 ### D17: Cooperative cancellation for probe timeout
 
-Validator timeout handling uses cooperative cancellation: a shared cancellation event, tracked subprocesses, and per-command timeouts. Python validator threads are not forcibly killed. On timeout or SIGTERM, the runner terminates tracked subprocesses, lets validators flush partial findings, and writes a timeout-status probe output.
+Validator timeout handling uses cooperative cancellation: a shared cancellation event, tracked subprocesses, and per-command timeouts. Python validator threads are not forcibly killed. On timeout or SIGTERM, the runner terminates tracked subprocesses, lets validators flush partial findings, and writes a timeout- or cancelled-status probe output with per-validator `validator_status` values; started cross-rack validators flush `timeout`/`cancelled` path records for racks they derived but did not attempt.
 
 ## Risks / Trade-offs
 
@@ -168,7 +168,7 @@ Validator timeout handling uses cooperative cancellation: a shared cancellation 
 - [Large rack counts or many failed cross-rack paths can exceed the default per-unit probe timeout even with representative-node probing] -> Mitigation: timeout-budget tests calculate the wall-clock before implementation; the runner writes partial results with inconclusive unprobed rack-pairs rather than silently overrunning
 - [A broken source representative makes all outbound cross-rack probes from its rack fail or go inconclusive] -> Mitigation: report-generator reconciles both directions of each rack-pair link (failure inferred only when both directions fail; one-directional failure with a healthy reverse path becomes a source-node warning) and downgrades cross-rack findings from representatives with definitive phase-1 failures to inconclusive; outbound MTU observations from that rack are lost for the run
 - [Terraform partially applied leaves MAAS config incomplete] -> Mitigation: pre-flight validation catches this before deployment begins
-- [probe-timeout may expire before all validators complete] -> Mitigation: write partial results with `status: timeout`; report-generator treats missing checks as inconclusive
+- [probe-timeout may expire before all validators complete] -> Mitigation: write partial results with `status: timeout` and explicit per-validator/per-path statuses; report-generator derives the expected representative-sampled check universe from the topology rule and classifies unattempted checks as inconclusive
 
 ## Open Questions
 

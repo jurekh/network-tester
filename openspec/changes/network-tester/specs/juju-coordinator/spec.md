@@ -49,7 +49,7 @@ Each unit SHALL check the peer relation data for `probe-run-id` before starting 
 - **THEN** the unit SHALL NOT re-run probes (this run was already completed)
 
 ### Requirement: Set explicit Juju unit status for readiness and probe state
-The charm SHALL use Juju unit status to make CLI polling deterministic. During package installation and topology loading it SHALL set maintenance status. After the topology resource is loaded, node identity is resolved, and the unit is ready to observe `probe-run-id`, it SHALL set active status with a message indicating readiness. While the payload is running it SHALL set maintenance status indicating the active probe run-id. If topology loading, package installation, or identity resolution fails, it SHALL set blocked or error status with the failure reason before raising. After payload completion, including timeout-status payload output, it SHALL return to active status so `collect-results` can run.
+The charm SHALL use Juju unit status to make CLI polling deterministic. During package installation and topology loading it SHALL set maintenance status. After the topology resource is loaded, node identity is resolved, and the unit is ready to observe `probe-run-id`, it SHALL set active status with a message indicating readiness. While the payload is running it SHALL set maintenance status indicating the active probe run-id. If topology loading, package installation, or identity resolution fails, it SHALL set blocked or error status with the failure reason before raising. After payload completion, including timeout- or cancelled-status payload output, it SHALL return to active status so `collect-results` can run.
 
 #### Scenario: Unit ready for probe trigger
 - **WHEN** install completes, required packages are present, the topology is stored locally, and MAC matching resolves the node identity
@@ -80,6 +80,6 @@ When a unit's `peer-relation-changed` hook fires with a new `probe-run-id` in re
 - **WHEN** a new `probe-run-id` is observed in peer relation data
 - **THEN** the unit SHALL invoke the installed charm source `payload/probe.py <topology-path> <probe-timeout>` and wait for it to exit
 
-#### Scenario: Payload exits with timeout status
-- **WHEN** the payload writes probe-output.json with `"status": "timeout"` and exits 0
+#### Scenario: Payload exits with timeout or cancelled status
+- **WHEN** the payload writes probe-output.json with `"status": "timeout"` or `"status": "cancelled"` and exits 0
 - **THEN** the unit SHALL become active/idle normally so the collect-results action can retrieve the partial output
