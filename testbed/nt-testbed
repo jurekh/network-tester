@@ -33,6 +33,7 @@ CONFIG = yaml.safe_load((TESTBED_DIR / "topology.yaml").read_text())
 
 VM = CONFIG["vm"]["name"]
 PXE = CONFIG["pxe"]
+VLANS = CONFIG.get("vlans", {})
 MAAS_CFG = CONFIG["maas"]
 MAAS_URL = f"http://{PXE['gateway']}:5240/MAAS"
 VM_TREE = "/root/network-tester"
@@ -108,6 +109,39 @@ def expected_nodes():
     for rack in CONFIG["racks"].values():
         nodes.extend(rack["nodes"])
     return nodes
+
+
+def nic_cidr(nic):
+    """The subnet a configured NIC belongs to (PXE when untagged)."""
+    return VLANS[nic["vlan"]]["cidr"] if nic.get("vlan") else PXE["cidr"]
+
+
+def inner_nic_devices(host):
+    """NIC devices of an inner LXD instance: name -> device dict with hwaddr."""
+    raw = vm_out(f"lxc config show {host} --expanded", check=False)
+    if not raw:
+        return {}
+    doc = yaml.safe_load(raw)
+    nics = {n: d for n, d in (doc.get("devices") or {}).items() if d.get("type") == "nic"}
+    volatile = doc.get("config") or {}
+    for name, device in nics.items():
+        device["hwaddr"] = (volatile.get(f"volatile.{name}.hwaddr") or "").lower()
+    return nics
+
+
+def wait_all_ready(timeout=2400):
+    expected = {n["hostname"] for n in expected_nodes()}
+
+    def all_ready():
+        machines = maas_json("machines read")
+        states = {m["hostname"]: m["status_name"] for m in machines if m["hostname"] in expected}
+        failed = {h: s for h, s in states.items() if s.startswith("Failed")}
+        if failed:
+            fatal(f"commissioning failed: {failed}")
+        log(f"machine states: {states}")
+        return len(states) == len(expected) and all(s == "Ready" for s in states.values())
+
+    wait_for("all composed machines to reach Ready", all_ready, timeout=timeout, interval=30)
 
 
 # --- up steps ----------------------------------------------------------------
@@ -338,19 +372,256 @@ def ensure_machines():
             f"storage=main:{node['disk_gib']}"
         )
 
-    expected = {n["hostname"] for n in expected_nodes()}
-
-    def all_ready():
-        machines = maas_json("machines read")
-        states = {m["hostname"]: m["status_name"] for m in machines if m["hostname"] in expected}
-        failed = {h: s for h, s in states.items() if s.startswith("Failed")}
-        if failed:
-            fatal(f"commissioning failed: {failed}")
-        log(f"machine states: {states}")
-        return len(states) == len(expected) and all(s == "Ready" for s in states.values())
-
-    wait_for("all composed machines to reach Ready", all_ready, timeout=2400, interval=30)
+    wait_all_ready()
     log("all composed machines are Ready")
+
+
+def _ensure_forward(cidr):
+    """Allow the testbed VM to route this VLAN to PXE (Juju controller) and out.
+
+    The Juju controller stays on the untagged PXE segment and reaches node
+    agents by L3 routing through the testbed VM, so its MAC never appears on
+    the isolated VLANs the vlan-neighbor-validator probes. LXD sets the
+    FORWARD policy to DROP, so the routes need explicit ACCEPT rules.
+    """
+    for spec in (f"-s {cidr}", f"-d {cidr}"):
+        vm_run(
+            f"iptables -C FORWARD {spec} -j ACCEPT 2>/dev/null"
+            f" || iptables -A FORWARD {spec} -j ACCEPT"
+        )
+
+
+def _maas_vlan_for(fabric_name, tag, name):
+    """Find or create a MAAS fabric+VLAN for a tag; return (fabric, vlan)."""
+    fabric = next((f for f in maas_json("fabrics read") if f["name"] == fabric_name), None)
+    if fabric is None:
+        log(f"creating MAAS fabric {fabric_name}")
+        fabric = maas_json(f"fabrics create name={fabric_name}")
+    mvlan = next((v for v in maas_json(f"vlans read {fabric['id']}") if v["vid"] == tag), None)
+    if mvlan is None:
+        mvlan = maas_json(f"vlans create {fabric['id']} vid={tag} name={name}")
+    return fabric, mvlan
+
+
+def vlan_device(tag):
+    """Kernel name of the Linux 802.1q subinterface for a tag on the bridge."""
+    return f"{PXE['bridge']}.{tag}"
+
+
+def management_vlans():
+    return [(name, vlan) for name, vlan in VLANS.items() if vlan.get("management")]
+
+
+def _rc_vlan_iface(rack_id, dev):
+    rc = next(c for c in maas_json("rack-controllers read") if c["system_id"] == rack_id)
+    return next((i for i in rc["interface_set"] if i["name"] == dev), None)
+
+
+def ensure_vlan_networks():
+    """Linux 802.1q VLAN subinterfaces plus MAAS subnet/DHCP for management VLANs.
+
+    MAAS does not model OVS internal ports (its scanner reports only PCI cards
+    and its controller discovery cannot see OVS-internal VLAN tags), so the
+    rack-controller's presence on each management VLAN is a Linux 802.1q
+    subinterface (br-rack1.<tag>) on the bridge LOCAL port, which is an OVS
+    trunk. MAAS discovers these natively as vid-tagged VLAN interfaces and
+    serves DHCP on them; OVS bridges their frames to the nodes' access-tagged
+    ports. Pre-creating the fabric/VLAN/subnet lets MAAS link the discovered
+    interface to the right VLAN by IP. The data VLAN has no controller
+    presence (ensure_data_segments models it as its own data fabric). Run
+    before the inner LXD exists so the controller refresh sees a stable
+    interface set.
+    """
+    mgmt = management_vlans()
+    if not mgmt:
+        return
+    bridge = PXE["bridge"]
+    for name, vlan in mgmt:
+        tag, cidr, gateway = vlan["tag"], vlan["cidr"], vlan["gateway"]
+        dev = vlan_device(tag)
+        prefix = cidr.split("/")[1]
+        vm_run(
+            f"ip link show {dev} >/dev/null 2>&1 || "
+            f"ip link add link {bridge} name {dev} type vlan id {tag}"
+        )
+        vm_run(f"ip addr replace {gateway}/{prefix} dev {dev} && ip link set {dev} up")
+        vm_run(
+            f"iptables -t nat -C POSTROUTING -s {cidr} ! -d {cidr} -j MASQUERADE 2>/dev/null"
+            f" || iptables -t nat -A POSTROUTING -s {cidr} ! -d {cidr} -j MASQUERADE"
+        )
+        _ensure_forward(cidr)
+
+    rack_id = maas_json("rack-controllers read")[0]["system_id"]
+    for name, vlan in mgmt:
+        tag, cidr, gateway = vlan["tag"], vlan["cidr"], vlan["gateway"]
+        fabric_name = vlan.get("fabric", f"fabric-{name}")
+        _fabric, mvlan = _maas_vlan_for(fabric_name, tag, name)
+        subnet = next((s for s in maas_json("subnets read") if s["cidr"] == cidr), None)
+        if subnet is None:
+            log(f"creating MAAS subnet {cidr} for VLAN {name}")
+            maas_json(f"subnets create cidr={cidr} vlan={mvlan['id']} gateway_ip={gateway}")
+        elif subnet["vlan"]["id"] != mvlan["id"]:
+            maas_json(f"subnet update {subnet['id']} vlan={mvlan['id']} gateway_ip={gateway}")
+        elif subnet.get("gateway_ip") != gateway:
+            maas_json(f"subnet update {subnet['id']} gateway_ip={gateway}")
+
+    def discovered():
+        for name, vlan in mgmt:
+            iface = _rc_vlan_iface(rack_id, vlan_device(vlan["tag"]))
+            if iface is None or (iface.get("vlan") or {}).get("vid") != vlan["tag"]:
+                return False
+        return True
+
+    wait_for("rack-controller VLAN interface discovery", discovered, timeout=300, interval=15)
+
+    ranges = maas_json("ipranges read")
+    for name, vlan in mgmt:
+        tag, fabric_name = vlan["tag"], vlan.get("fabric", f"fabric-{name}")
+        rng = vlan.get("dhcp_range")
+        if rng and not any(r["start_ip"] == rng["start"] for r in ranges):
+            log(f"creating dynamic DHCP range for VLAN {name}: {rng['start']}-{rng['end']}")
+            maas_json(f"ipranges create type=dynamic start_ip={rng['start']} end_ip={rng['end']}")
+        iface = _rc_vlan_iface(rack_id, vlan_device(tag))
+        mvlan = iface["vlan"]
+        if not mvlan["dhcp_on"]:
+            log(f"enabling MAAS DHCP on VLAN {name} (fabric {fabric_name})")
+            maas_json(
+                f"vlan update {mvlan['fabric_id']} {mvlan['vid']} "
+                f"dhcp_on=true primary_rack={rack_id}"
+            )
+    log("management VLAN networks configured (802.1q subinterfaces, subnets, DHCP)")
+
+
+def ensure_data_segments():
+    """Model controller-less VLANs (the data fabric) explicitly in MAAS."""
+    for name, vlan in VLANS.items():
+        if vlan.get("management"):
+            continue
+        fabric_name = vlan["fabric"]
+        fabric = next((f for f in maas_json("fabrics read") if f["name"] == fabric_name), None)
+        if fabric is None:
+            log(f"creating MAAS fabric {fabric_name}")
+            fabric = maas_json(f"fabrics create name={fabric_name}")
+        mvlan = next(
+            (v for v in maas_json(f"vlans read {fabric['id']}") if v["vid"] == vlan["tag"]), None
+        )
+        if mvlan is None:
+            mvlan = maas_json(f"vlans create {fabric['id']} vid={vlan['tag']} name={name}")
+        subnet = next((s for s in maas_json("subnets read") if s["cidr"] == vlan["cidr"]), None)
+        if subnet is None:
+            log(f"creating MAAS subnet {vlan['cidr']} on fabric {fabric_name}")
+            maas_json(f"subnets create cidr={vlan['cidr']} vlan={mvlan['id']}")
+        elif subnet["vlan"]["id"] != mvlan["id"]:
+            maas_json(f"subnet update {subnet['id']} vlan={mvlan['id']}")
+
+
+def set_nic_vlan(host, device, tag):
+    vm_run(f"lxc config device set {host} {device} vlan={tag}")
+
+
+def ensure_node_networking():
+    """Attach per-node NIC devices with OVS tags; recommission changed nodes.
+
+    Composed nodes first commission on the untagged PXE segment; this step
+    retags their boot NIC onto the configured VLAN (which has MAAS DHCP),
+    adds any additional NICs, and recommissions so MAAS records the NICs on
+    the right segments.
+    """
+    machines = {m["hostname"]: m for m in maas_json("machines read")}
+    to_commission = []
+    for node in expected_nodes():
+        host = node["hostname"]
+        nics_cfg = node.get("nics", [])
+        devices = inner_nic_devices(host)
+        if not devices:
+            fatal(f"inner LXD has no instance named {host}")
+        names = sorted(devices)
+        changed = False
+        boot_dev = names[0]
+        want_tag = VLANS[nics_cfg[0]["vlan"]]["tag"] if nics_cfg[0].get("vlan") else None
+        have_tag = devices[boot_dev].get("vlan")
+        if want_tag is not None and str(want_tag) != str(have_tag or ""):
+            log(f"{host}: tagging boot NIC {boot_dev} onto VLAN {want_tag}")
+            set_nic_vlan(host, boot_dev, want_tag)
+            changed = True
+        for idx in range(1, len(nics_cfg)):
+            device = f"eth{idx}"
+            if device in devices:
+                continue
+            nic = nics_cfg[idx]
+            tag = VLANS[nic["vlan"]]["tag"] if nic.get("vlan") else None
+            tag_arg = f" vlan={tag}" if tag is not None else ""
+            log(f"{host}: adding NIC {device} on {nic['bridge']}{tag_arg}")
+            vm_run(
+                f"lxc config device add {host} {device} nic "
+                f"nictype=bridged parent={nic['bridge']}{tag_arg}"
+            )
+            changed = True
+        machine = machines.get(host)
+        if machine is None:
+            fatal(f"MAAS has no machine named {host}")
+        physical = [i for i in machine["interface_set"] if i.get("type") == "physical"]
+        if changed or len(physical) < len(nics_cfg):
+            to_commission.append(host)
+    for host in to_commission:
+        machine = machines[host]
+        if machine["status_name"] != "Ready":
+            fatal(f"cannot recommission {host} in state {machine['status_name']}")
+        log(f"recommissioning {host} to record NIC changes")
+        maas_json(f"machine commission {machine['system_id']}")
+    if to_commission:
+        wait_all_ready()
+
+
+def ensure_addressing():
+    """Enforce per-NIC VLAN attachment and STATIC IPs from topology.yaml.
+
+    STATIC addressing (not AUTO/DHCP) is required because the CLI fetches
+    the topology before deployment and the validators need peer IPs; AUTO
+    links carry no address until deploy time. Idempotent: matching machines
+    are untouched, so this also serves as the fault-clear restore path.
+    """
+    subnets = {s["cidr"]: s for s in maas_json("subnets read")}
+    machines = {m["hostname"]: m for m in maas_json("machines read")}
+    for node in expected_nodes():
+        host = node["hostname"]
+        machine = machines.get(host)
+        if machine is None:
+            fatal(f"MAAS has no machine named {host}")
+        devices = inner_nic_devices(host)
+        names = sorted(devices)
+        by_mac = {
+            (i.get("mac_address") or "").lower(): i
+            for i in machine["interface_set"]
+            if i.get("type") == "physical"
+        }
+        for idx, nic in enumerate(node.get("nics", [])):
+            ip = nic.get("ip")
+            if not ip or idx >= len(names):
+                continue
+            mac = devices[names[idx]].get("hwaddr")
+            interface = by_mac.get(mac)
+            if interface is None:
+                fatal(f"{host}: MAAS has no interface with MAC {mac}; recommission needed")
+            subnet = subnets[nic_cidr(nic)]
+            if (interface.get("vlan") or {}).get("id") != subnet["vlan"]["id"]:
+                maas_json(
+                    f"interface update {machine['system_id']} {interface['id']} "
+                    f"vlan={subnet['vlan']['id']}"
+                )
+            links = _addressed_links(interface)
+            if len(links) == 1 and links[0].get("ip_address") == ip:
+                continue
+            for link in links:
+                maas_json(
+                    f"interface unlink-subnet {machine['system_id']} "
+                    f"{interface['id']} id={link['id']}"
+                )
+            maas_json(
+                f"interface link-subnet {machine['system_id']} {interface['id']} "
+                f"mode=STATIC subnet={subnet['id']} ip_address={ip}"
+            )
+            log(f"{host} {interface['name']}: STATIC {ip} on {subnet['cidr']}")
 
 
 JUJU_CONTROLLER = "nt"
@@ -404,17 +675,21 @@ def ensure_juju():
         vm_run(
             f"juju add-cloud {MAAS_CLOUD} -f /root/nt-cloud.yaml --controller {JUJU_CONTROLLER}"
         )
+    key = vm_out(f"maas apikey --username {MAAS_CFG['admin_user']}")
+    cred_yaml = (
+        f"credentials:\n  {MAAS_CLOUD}:\n    admin:\n"
+        f"      auth-type: oauth1\n      maas-oauth: {key}\n"
+    )
+    vm_run(f"cat > /root/nt-cred.yaml <<'EOF'\n{cred_yaml}EOF")
+    # The client-local credential is required so python-libjuju resolves it by
+    # name when creating models. Without it, controller.add_model() finds no
+    # local credential, leaves it unset, and the controller falls back to its
+    # own bootstrap (LXD certificate) credential, which MAAS rejects with
+    # "certificate auth-type not supported". The `network-tester` CLI uses
+    # libjuju, so the client store must carry the MAAS credential.
+    vm_run(f"juju add-credential {MAAS_CLOUD} -f /root/nt-cred.yaml --client 2>/dev/null || true")
     if MAAS_CLOUD not in controller_json("credentials", "controller-credentials"):
         log(f"adding MAAS credential for cloud {MAAS_CLOUD}")
-        key = vm_out(f"maas apikey --username {MAAS_CFG['admin_user']}")
-        cred_yaml = (
-            f"credentials:\n  {MAAS_CLOUD}:\n    admin:\n"
-            f"      auth-type: oauth1\n      maas-oauth: {key}\n"
-        )
-        vm_run(f"cat > /root/nt-cred.yaml <<'EOF'\n{cred_yaml}EOF")
-        # add-credential refuses when a client-local copy already exists, so
-        # clear any local copy and add straight to the controller
-        vm_run(f"juju remove-credential {MAAS_CLOUD} admin --client 2>/dev/null || true")
         vm_run(
             f"juju add-credential {MAAS_CLOUD} -f /root/nt-cred.yaml "
             f"--controller {JUJU_CONTROLLER}"
@@ -495,9 +770,16 @@ def cmd_up():
     ensure_maas()
     ensure_subnet_dhcp()
     ensure_images()
+    # Model the management VLANs and the data fabric before the inner LXD
+    # exists, so the rack-controller refresh runs against a clean interface
+    # set (no churning node taps) when the VLAN ports are added.
+    ensure_vlan_networks()
+    ensure_data_segments()
     ensure_inner_lxd()
     ensure_vm_host()
     ensure_machines()
+    ensure_node_networking()
+    ensure_addressing()
     sync_tree()
     ensure_juju()
     report_ui_address()
@@ -566,8 +848,10 @@ def verify_foundation():
     failures = []
     if actual != expected:
         failures.append(f"machine set mismatch: expected {sorted(expected)}, got {sorted(actual)}")
+    by_hostname = {n["hostname"]: n for n in expected_nodes()}
     for m in machines:
-        if m["hostname"] not in expected:
+        node = by_hostname.get(m["hostname"])
+        if node is None:
             continue
         if m["status_name"] != "Ready":
             failures.append(f"{m['hostname']}: status {m['status_name']}, expected Ready")
@@ -580,15 +864,17 @@ def verify_foundation():
             for link in nic.get("links", [])
             if link.get("subnet")
         }
-        if PXE["cidr"] not in subnets:
+        wanted = {nic_cidr(nic) for nic in node.get("nics", [])}
+        if not wanted <= subnets:
             failures.append(
-                f"{m['hostname']}: no subnet record for {PXE['cidr']} (has {sorted(subnets)})"
+                f"{m['hostname']}: missing subnet records for {sorted(wanted - subnets)} "
+                f"(has {sorted(subnets)})"
             )
     if failures:
         for failure in failures:
             log(f"FAIL: {failure}")
         sys.exit(1)
-    log(f"verify foundation: PASS ({len(expected)} machines Ready on {PXE['cidr']})")
+    log(f"verify foundation: PASS ({len(expected)} machines Ready with configured subnets)")
 
 
 def network_tester_run(extra_args):
@@ -605,9 +891,9 @@ def network_tester_run(extra_args):
 def verify_topology():
     """Dry-run against the testbed MAAS, plus the incomplete-config fault.
 
-    The stage-3 testbed has only the management/PXE network, so the composed
-    nodes classify as bmc-oam (their single fabric is a rack-controller
-    fabric); the data VLAN that makes them data-role arrives in stage 5.
+    Since stage 5 the data nodes have a data-VLAN NIC (role data) and the
+    additional small node lives on the oam VLAN (role bmc-oam); per-node
+    expectations come from topology.yaml.
     """
     sync_tree()
     problems = []
@@ -619,10 +905,11 @@ def verify_topology():
         problems.append(f"clean dry-run exited {result.returncode}:\n{output}")
     else:
         for node in expected_nodes():
-            pattern = rf"{node['hostname']} \(\w+\) rack=\S+ role=bmc-oam"
+            role = node.get("role", "data")
+            pattern = rf"{node['hostname']} \(\w+\) rack=\S+ role={role}"
             if not re.search(pattern, output):
                 problems.append(
-                    f"dry-run output missing '{node['hostname']} ... role=bmc-oam':\n{output}"
+                    f"dry-run output missing '{node['hostname']} ... role={role}':\n{output}"
                 )
         for section in ("Would run:", "Would skip:"):
             if section not in output:
@@ -723,12 +1010,13 @@ def verify_skeleton():
         for marker in (
             "triggering probe run",
             f"collecting results from {node_count} unit(s)",
-            "All 0 checks passed.",
             "report written to ",
             "destroying model network-test-",
         ):
             if marker not in output:
                 problems.append(f"run --all output missing '{marker}':\n{output}")
+        if not re.search(r"All \d+ checks passed\.", output):
+            problems.append(f"run --all output missing 'All N checks passed.':\n{output}")
         match = re.search(r"report written to (\S+network-test-\S+\.json)", output)
         if match:
             report_raw = vm_out(f"cat {shlex.quote(match.group(1))}", check=False)
@@ -768,7 +1056,7 @@ def verify_skeleton():
 
             result = network_tester_run(f"--reuse-model {model} --wait-timeout 600")
             output = result.stdout + result.stderr
-            if result.returncode != 0 or "All 0 checks passed." not in output:
+            if result.returncode != 0 or not re.search(r"All \d+ checks passed\.", output):
                 problems.append(f"reuse-model run failed ({result.returncode}):\n{output}")
 
             log(f"destroying kept model {model}")
@@ -782,10 +1070,117 @@ def verify_skeleton():
     log("verify skeleton: PASS (jubilant test, full pipeline, keep/status/reuse)")
 
 
+def report_from_output(output):
+    """Parse the JSON report referenced by a network-tester run's output."""
+    match = re.search(r"report written to (\S+network-test-\S+\.json)", output)
+    if not match:
+        return None
+    raw = vm_out(f"cat {shlex.quote(match.group(1))}", check=False)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def verify_vlan():
+    """Stage 5 gate: clean pass, wrong-vlan fault findings, partial-scope skips."""
+    charm_name = ensure_charm_packed()
+    sync_tree()
+    ensure_juju()
+    destroy_test_models()
+    clear_faults()
+    problems = []
+    deploy_args = f"--charm charm/{charm_name} --cloud {MAAS_CLOUD} --wait-timeout 1800"
+    machine_ids = {m["hostname"]: m["system_id"] for m in maas_json("machines read")}
+
+    log("verify vlan: clean run (model kept for the fault re-trigger)")
+    result = network_tester_run(f"--all --keep-model {deploy_args}")
+    output = result.stdout + result.stderr
+    model_match = re.search(r"Model (network-test-\S+) kept", output)
+    report = report_from_output(output)
+    if result.returncode != 0 or model_match is None or report is None:
+        problems.append(f"clean run failed ({result.returncode}):\n{output}")
+    else:
+        if report["definitive_failures"]:
+            problems.append(
+                "clean run has failures:\n" + json.dumps(report["definitive_failures"], indent=2)
+            )
+        if report["summary"]["passed_count"] < 1:
+            problems.append(f"clean run passed no VLAN checks:\n{json.dumps(report['summary'])}")
+        if report["warnings"]:
+            problems.append("clean run has warnings:\n" + json.dumps(report["warnings"], indent=2))
+
+    if not problems and model_match:
+        model = model_match.group(1)
+        target = "r1-data-02"
+        data_mac = vm_out(f"lxc config get {target} volatile.eth1.hwaddr").lower()
+        log(f"verify vlan: wrong-vlan fault on {target}")
+        fault_wrong_vlan([target])
+        result = network_tester_run(f"--reuse-model {model} --wait-timeout 900")
+        output = result.stdout + result.stderr
+        report = report_from_output(output)
+        if report is None:
+            problems.append(f"fault run produced no report:\n{output}")
+        else:
+            failures = report["definitive_failures"]
+            missing_peer = [
+                f
+                for f in failures
+                if f["type"] in ("missing-l2-neighbor", "icmp-unreachable")
+                and f.get("details", {}).get("peer_system_id") == machine_ids[target]
+            ]
+            if not missing_peer:
+                problems.append(
+                    f"fault run records no missing-peer failure for {target}:\n"
+                    + json.dumps(failures, indent=2)
+                )
+            elif not any("verify VLAN assignment" in f.get("hint", "") for f in missing_peer):
+                problems.append("missing-peer failure lacks the remediation hint")
+            unexpected = [
+                f
+                for f in failures
+                if f["type"] == "unexpected-l2-neighbor"
+                and f.get("details", {}).get("mac") == data_mac
+            ]
+            if not unexpected:
+                problems.append(
+                    f"no unexpected-l2-neighbor finding for {target}'s data NIC {data_mac}:\n"
+                    + json.dumps(failures, indent=2)
+                )
+            if result.returncode != 1:
+                problems.append(f"fault run exited {result.returncode}, expected 1")
+        log("verify vlan: clearing fault and destroying kept model")
+        clear_faults()
+        vm_run(f"juju destroy-model --no-prompt --force --timeout 15m {model}", check=False)
+        wait_nodes_ready()
+
+    if not problems:
+        log("verify vlan: partial-scope run (--nodes r1-data-01)")
+        result = network_tester_run(f"--nodes r1-data-01 {deploy_args}")
+        output = result.stdout + result.stderr
+        report = report_from_output(output)
+        excluded = machine_ids["r1-data-02"]
+        if result.returncode != 0 or report is None:
+            problems.append(f"partial-scope run failed ({result.returncode}):\n{output}")
+        elif not any(e.get("peer") == excluded for e in report["skipped_checks"]):
+            problems.append(
+                f"partial-scope report lacks a grouped skip entry for {excluded}:\n"
+                + json.dumps(report["skipped_checks"], indent=2)
+            )
+        wait_nodes_ready()
+
+    if problems:
+        for problem in problems:
+            log(f"FAIL: {problem}")
+        sys.exit(1)
+    log("verify vlan: PASS (clean, wrong-vlan fault, partial scope)")
+
+
 VERIFY_STAGES = {
     "foundation": verify_foundation,
     "topology": verify_topology,
     "skeleton": verify_skeleton,
+    "vlan": verify_vlan,
 }
 
 
@@ -827,28 +1222,63 @@ def fault_incomplete_config(args):
 
 
 def clear_incomplete_config():
-    """Restore subnet links on any interface that lost them (from topology.yaml)."""
-    subnets = maas_json("subnets read")
-    pxe = next((s for s in subnets if s["cidr"] == PXE["cidr"]), None)
-    if pxe is None:
-        fatal(f"PXE subnet {PXE['cidr']} not found in MAAS")
-    for machine in maas_json("machines read"):
-        for interface in machine["interface_set"]:
-            if not interface.get("vlan"):
-                continue
-            if _addressed_links(interface):
-                continue
-            maas_json(
-                f"interface link-subnet {machine['system_id']} "
-                f"{interface['id']} mode=AUTO subnet={pxe['id']}"
-            )
-            log(
-                f"fault cleared: restored subnet link on {machine['hostname']} {interface['name']}"
-            )
+    """Restore VLAN attachments and STATIC links from topology.yaml."""
+    ensure_addressing()
 
 
-FAULTS = {"incomplete-config": fault_incomplete_config}
-CLEAR_FUNCS = [clear_incomplete_config]
+def _node_tagged_nics(node):
+    """(index, nic, tag) for each NIC of a node that has a VLAN tag."""
+    out = []
+    for idx, nic in enumerate(node.get("nics", [])):
+        if nic.get("vlan"):
+            out.append((idx, nic, VLANS[nic["vlan"]]["tag"]))
+    return out
+
+
+def _ovs_port_for(host, device):
+    """The OVS port name backing a running instance's NIC device."""
+    port = vm_out(f"lxc config get {host} volatile.{device}.host_name", check=False)
+    if not port:
+        fatal(f"{host} {device} has no host-side port; is the instance running?")
+    return port
+
+
+def fault_wrong_vlan(args):
+    """Retag a node's data NIC onto the oam VLAN (wrong segment)."""
+    if len(args) != 1:
+        fatal("usage: nt-testbed fault wrong-vlan <hostname>")
+    hostname = args[0]
+    node = next((n for n in expected_nodes() if n["hostname"] == hostname), None)
+    if node is None:
+        fatal(f"no node named {hostname} in topology.yaml")
+    data = [(i, n, t) for i, n, t in _node_tagged_nics(node) if n["vlan"] == "data"]
+    if not data:
+        fatal(f"{hostname} has no data NIC to retag")
+    idx, _nic, _tag = data[0]
+    devices = sorted(inner_nic_devices(hostname))
+    device = devices[idx]
+    other_tag = VLANS["oam"]["tag"]
+    vm_run(f"ovs-vsctl set port {_ovs_port_for(hostname, device)} tag={other_tag}")
+    log(f"fault injected: {hostname} {device} retagged to VLAN {other_tag} (oam)")
+
+
+def clear_wrong_vlan():
+    """Restore configured OVS tags on all running nodes' NICs."""
+    for node in expected_nodes():
+        devices = sorted(inner_nic_devices(node["hostname"]))
+        for idx, _nic, tag in _node_tagged_nics(node):
+            if idx >= len(devices):
+                continue
+            port = vm_out(
+                f"lxc config get {node['hostname']} volatile.{devices[idx]}.host_name",
+                check=False,
+            )
+            if port:
+                vm_run(f"ovs-vsctl set port {port} tag={tag}", check=False)
+
+
+FAULTS = {"incomplete-config": fault_incomplete_config, "wrong-vlan": fault_wrong_vlan}
+CLEAR_FUNCS = [clear_wrong_vlan, clear_incomplete_config]
 
 
 def clear_faults():

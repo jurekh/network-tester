@@ -12,7 +12,7 @@ import probe
 import probe_runner
 import pytest
 import schemas
-from conftest import FIXTURES, load_fixture
+from conftest import FIXTURES, PING_OK, load_fixture
 
 TOPOLOGY = FIXTURES / "topology_mixed_scope.json"
 
@@ -122,10 +122,13 @@ def test_local_macs_parses_ip_link_output(monkeypatch):
 # --- full run with stub validators (4.3, 4.9, 4.10) -----------------------------
 
 
-def test_full_probe_run_writes_schema_valid_output(monkeypatch, tmp_path, capsys):
+def test_full_probe_run_writes_schema_valid_output(monkeypatch, tmp_path, capsys, fake_tools):
     output = tmp_path / "var" / "log" / "probe-output.json"
     monkeypatch.setattr(probe_runner, "OUTPUT_PATH", output)
     monkeypatch.setattr(probe, "local_macs", lambda: {"52:54:00:01:01:01"})
+    # the vlan validator's expected peer (aaa002) answers ARP and ICMP
+    fake_tools["arp"]["10.20.1.12"] = True
+    fake_tools["ping3"]["10.20.1.12"] = PING_OK
 
     assert probe.main([str(TOPOLOGY), "30"]) == 0
 

@@ -213,7 +213,10 @@ def _build_machine(node, role, rack, in_scope, management_fabrics):
     interfaces = []
     unconfigured = []
     for interface in interface_set:
-        if interface.get("type") not in ("physical", "bond"):
+        # vlan: tagged 802.1q interfaces (e.g. a machine's presence on a
+        # trunked management VLAN) are real L2 peers and must be recorded so
+        # nodes on that VLAN recognize them instead of flagging them unexpected.
+        if interface.get("type") not in ("physical", "bond", "vlan"):
             continue
         if interface.get("name") in members:
             continue

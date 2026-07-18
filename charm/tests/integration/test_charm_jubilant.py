@@ -114,9 +114,19 @@ def test_deploy_trigger_and_collect(juju):
     assert output["status"] == "complete"
     assert output["node"]["system_id"] == "bmc001"
     assert output["node"]["hostname"] == "r1-bmc-01"
-    for section in ("bond_validator", "vlan_neighbor_validator", "mtu_validator", "bgp_inference"):
+    for section in ("bond_validator", "mtu_validator", "bgp_inference"):
         assert output[section]["validator_status"] == "complete"
         assert output[section]["findings"] == []
+    # The LXD machine shares its bridge with the Juju controller and other
+    # instances, so the real vlan validator's passive capture may record
+    # unexpected-neighbor findings for that environment noise; correctness
+    # of those findings is covered by unit tests and testbed verify vlan.
+    vlan_section = output["vlan_neighbor_validator"]
+    assert vlan_section["validator_status"] == "complete"
+    assert {f["type"] for f in vlan_section["findings"]} <= {
+        "unexpected-l2-neighbor",
+        "unexpected-reachability",
+    }
 
     # re-applying the same run-id must not re-run the probe (hook no-ops)
     juju.config(APP, {"probe-run-id": run_id})

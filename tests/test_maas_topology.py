@@ -95,6 +95,36 @@ def test_bond_members_are_not_separate_interfaces():
     assert names == ["bond0"]
 
 
+def test_tagged_vlan_interface_recorded_with_tag_and_fabric():
+    # A tagged 802.1q interface (e.g. a controller's management-VLAN presence
+    # over a trunk) must be a recognized peer with its own fabric and vlan_tag,
+    # not dropped; otherwise nodes on that VLAN flag its MAC as unexpected.
+    rc = rack_controller(
+        ifaces=[
+            iface(
+                "br0",
+                "52:54:00:00:00:01",
+                vlan("fabric-mgmt", 0),
+                links=[link("10.10.1.0/24")],
+            ),
+            iface(
+                "br0.30",
+                "52:54:00:00:00:30",
+                vlan("fabric-mgmt", 30),
+                type="vlan",
+                links=[link("10.10.4.0/24", "10.10.4.1")],
+                parents=["br0"],
+            ),
+        ]
+    )
+    topology = fetch([data_machine("aaa001", "data-01")], rack_controllers=[rc])
+    names = {i["name"]: i for i in by_hostname(topology)["rack1-ctl"]["interfaces"]}
+    assert "br0.30" in names
+    assert names["br0.30"]["vlan_tag"] == 30
+    assert names["br0.30"]["fabric"] == "fabric-mgmt"
+    assert names["br0.30"]["ip"] == "10.10.4.1"
+
+
 # --- anchors and scoping (3.1, 3.4) -------------------------------------------
 
 

@@ -92,3 +92,217 @@ def test_save_report_writes_timestamped_files_and_prints(tmp_path, capsys):
     out = capsys.readouterr().out
     assert text_path.read_text() == out
     assert "All 0 checks passed." in out
+
+
+# --- classification core: expected-universe diffing (5.8-5.11) ----------------------
+
+TOPOLOGY = load_fixture(FIXTURES / "topology_mixed_scope.json")
+
+
+def vlan_observation(peer_sid, peer_ip, interface="eth0"):
+    return {
+        "type": "expected-peer-observed",
+        "interface": interface,
+        "peer_system_id": peer_sid,
+        "peer_ip": peer_ip,
+        "peer_mac": "52:54:00:00:00:00",
+        "arp_observed": True,
+        "icmp_reachable": True,
+        "rtt_ms": {"min": 0.2, "avg": 0.3, "max": 0.5},
+        "loss_pct": 0,
+    }
+
+
+def probe_doc(sid, hostname, vlan=None, bgp=None, mtu=None, representative=False):
+    """Synthetic probe output with given vlan observations and path records."""
+    skipped = {
+        "validator_status": "skipped",
+        "skip_reason": "not-rack-representative",
+        "findings": [],
+    }
+    return {
+        "schema_version": "1",
+        "status": "complete",
+        "node": {"system_id": sid, "hostname": hostname, "interfaces": []},
+        "bond_validator": {"validator_status": "complete", "bonds": [], "findings": []},
+        "vlan_neighbor_validator": {
+            "validator_status": "complete",
+            "findings": (vlan or {}).get("findings", []),
+            "observations": (vlan or {}).get("observations", []),
+        },
+        "mtu_validator": (
+            {"validator_status": "complete", "cross_rack_mtu": mtu or [], "findings": []}
+            if representative
+            else dict(skipped, cross_rack_mtu=[])
+        ),
+        "bgp_inference": (
+            {"validator_status": "complete", "paths": bgp or [], "findings": []}
+            if representative
+            else dict(skipped, paths=[])
+        ),
+    }
+
+
+def bgp_path(source_rack, source, target_rack, target, status="success", reachable=True):
+    return {
+        "source_rack": source_rack,
+        "source_node": source,
+        "target_rack": target_rack,
+        "representative_target": target,
+        "fallback_target": None,
+        "reachable": reachable,
+        "target_role": "representative" if reachable else None,
+        "observation_status": status,
+    }
+
+
+def mtu_record(source_rack, source, target_rack, target, mtu=9000, status="success"):
+    return {
+        "source_rack": source_rack,
+        "source_node": source,
+        "target_rack": target_rack,
+        "target_node": target,
+        "observed_path_mtu_bytes": mtu,
+        "observation_status": status,
+    }
+
+
+def three_node_outputs():
+    """aaa001+aaa002 (rack-1) and bbb002 (rack-2) report; bbb003 is missing."""
+    return [
+        probe_doc(
+            "aaa001",
+            "r1-data-01",
+            vlan={
+                "observations": [
+                    vlan_observation("aaa002", "10.20.1.12", "bond0"),
+                    {
+                        "type": "known-out-of-scope-peer-observed",
+                        "interface": "bond0",
+                        "peer_system_id": "aaa003",
+                        "peer_mac": "52:54:00:01:03:01",
+                        "skipped": True,
+                    },
+                ]
+            },
+            bgp=[bgp_path("rack-1", "aaa001", "rack-2", "bbb002")],
+            mtu=[mtu_record("rack-1", "aaa001", "rack-2", "bbb002")],
+            representative=True,
+        ),
+        probe_doc(
+            "aaa002",
+            "r1-data-02",
+            vlan={"observations": [vlan_observation("aaa001", "10.20.1.11")]},
+        ),
+        probe_doc(
+            "bbb002",
+            "r2-data-02",
+            vlan={"observations": [vlan_observation("bbb003", "10.20.2.13")]},
+            bgp=[bgp_path("rack-2", "bbb002", "rack-1", "aaa001")],
+            mtu=[mtu_record("rack-2", "bbb002", "rack-1", "aaa001", mtu=1500)],
+            representative=True,
+        ),
+    ]
+
+
+def test_bidirectional_confirmation_and_pass_counting():
+    missing = [{"system_id": "bbb003", "hostname": "r2-data-03", "reason": "no-probe-output"}]
+    report = report_generator.generate_report(
+        three_node_outputs(), missing_nodes=missing, topology=TOPOLOGY, verbose=True
+    )
+    assert schemas.validate_report(report) == []
+    assert report["definitive_failures"] == []
+    passed = {(e["type"], e.get("confirmed")) for e in report["passed_checks"]}
+    # vlan aaa001<->aaa002 bidirectional; vlan bbb002->bbb003 unidirectional;
+    # bgp rack-1->rack-2 and rack-2->rack-1
+    assert ("vlan-reachability", "bidirectional") in passed
+    assert ("vlan-reachability", "unidirectional") in passed
+    assert len([e for e in report["passed_checks"] if e["type"] == "bgp-reachability"]) == 2
+    assert report["summary"]["passed_count"] == 4
+    # unidirectional edge produces a warning naming both nodes
+    uni = [w for w in report["warnings"] if w["type"] == "unidirectional-observation"]
+    assert len(uni) == 1
+    assert "r2-data-02" in uni[0]["message"] and "r2-data-03" in uni[0]["message"]
+
+
+def test_skips_grouped_by_missing_peer():
+    report = report_generator.generate_report(three_node_outputs(), topology=TOPOLOGY)
+    skips = {e["peer"]: e for e in report["skipped_checks"]}
+    # aaa003 blocks 2 rack-1 edges; bbb001 blocks 2 rack-2 edges
+    assert skips["aaa003"]["count"] == 2
+    assert skips["bbb001"]["count"] == 2
+    assert skips["aaa003"]["message"] == "2 checks skipped - add aaa003 to test these paths"
+    assert report["summary"]["skipped"] == 2
+
+
+def test_vlan_edge_failure_not_counted_as_pass():
+    outputs = three_node_outputs()
+    outputs[0]["vlan_neighbor_validator"]["observations"] = []
+    outputs[0]["vlan_neighbor_validator"]["findings"] = [
+        {
+            "type": "missing-l2-neighbor",
+            "classification": "definitive",
+            "scope": "interface",
+            "hint": "Expected L2 neighbor r1-data-02 (10.20.1.12) did not respond to ARP",
+            "details": {"interface": "bond0", "peer_system_id": "aaa002"},
+        }
+    ]
+    outputs[1]["vlan_neighbor_validator"]["observations"] = []
+    report = report_generator.generate_report(outputs, topology=TOPOLOGY, verbose=True)
+    assert [f["type"] for f in report["definitive_failures"]] == ["missing-l2-neighbor"]
+    assert not [
+        e
+        for e in report["passed_checks"]
+        if e["type"] == "vlan-reachability" and set(e["nodes"]) == {"r1-data-01", "r1-data-02"}
+    ]
+    assert report_generator.exit_code(report) == 1
+
+
+def test_vlan_edge_without_any_data_is_inconclusive():
+    outputs = three_node_outputs()
+    outputs[0]["vlan_neighbor_validator"]["observations"] = []
+    outputs[1]["vlan_neighbor_validator"]["validator_status"] = "not_started"
+    outputs[1]["vlan_neighbor_validator"]["observations"] = []
+    report = report_generator.generate_report(outputs, topology=TOPOLOGY)
+    entries = [e for e in report["inconclusive_checks"] if e["type"] == "vlan-reachability"]
+    assert len(entries) == 1
+    assert "r1-data-01" in entries[0]["note"] and "r1-data-02" in entries[0]["note"]
+
+
+def test_expected_bgp_path_without_record_is_inconclusive():
+    # rack-2 representative bbb002 never reports: its expected path is inconclusive
+    outputs = three_node_outputs()[:2]
+    missing = [{"system_id": "bbb002", "hostname": "r2-data-02", "reason": "probe-timeout"}]
+    report = report_generator.generate_report(
+        outputs, missing_nodes=missing, topology=TOPOLOGY, verbose=True
+    )
+    entries = [e for e in report["inconclusive_checks"] if e["type"] == "bgp-reachability"]
+    assert len(entries) == 1
+    assert entries[0]["details"]["rack_pair"] == ["rack-2", "rack-1"]
+    # the reported direction still passes
+    assert len([e for e in report["passed_checks"] if e["type"] == "bgp-reachability"]) == 1
+
+
+def test_mtu_records_become_observations_and_timeouts_inconclusive():
+    outputs = three_node_outputs()
+    outputs[2]["mtu_validator"]["cross_rack_mtu"] = [
+        mtu_record("rack-2", "bbb002", "rack-1", "aaa001", mtu=None, status="timeout")
+    ]
+    report = report_generator.generate_report(outputs, topology=TOPOLOGY)
+    obs = [o for o in report["observations"] if o["type"] == "cross-rack-mtu"]
+    assert len(obs) == 2
+    assert {o["observation_status"] for o in obs} == {"success", "timeout"}
+    entries = [e for e in report["inconclusive_checks"] if e["type"] == "cross-rack-mtu"]
+    assert len(entries) == 1
+    assert entries[0]["details"]["rack_pair"] == ["rack-2", "rack-1"]
+
+
+def test_non_representative_skips_create_no_coverage_gaps():
+    report = report_generator.generate_report(three_node_outputs(), topology=TOPOLOGY)
+    assert not [
+        e
+        for e in report["inconclusive_checks"]
+        if e["type"] in ("bgp-reachability", "cross-rack-mtu")
+    ]
+    # aaa002's skipped cross-rack sections add nothing to skips either
+    assert {e["peer"] for e in report["skipped_checks"]} == {"aaa003", "bbb001"}

@@ -12,12 +12,47 @@ vm:
   # Reduced profile guidance for smaller hosts is in README.md; lower these
   # values here if needed (MAAS + 2 nodes fits in 4 CPU / 12GiB).
 
-# Management/PXE network, served by MAAS DHCP inside the testbed VM.
+# Management/PXE network, served by MAAS DHCP inside the testbed VM. Nodes
+# only commission here on first compose; their NICs are then retagged onto
+# the VLANs below. The untagged segment keeps the MAAS region, inner LXD API,
+# and the Juju controller container, whose ARP traffic must not appear on the
+# segments the vlan-neighbor-validator captures on.
 pxe:
   bridge: br-rack1
   cidr: 10.100.1.0/24
   gateway: 10.100.1.1          # testbed VM address on the bridge
   dhcp_range: {start: 10.100.1.100, end: 10.100.1.200}
+
+# Tagged VLANs carried over br-rack1 via OVS access-port tags on the node
+# ports. `management: true` VLANs get a rack-controller presence: a Linux
+# 802.1q subinterface (br-rack1.<tag>) on the bridge LOCAL port (an OVS
+# trunk), which MAAS discovers natively as a vid-tagged VLAN interface and
+# serves DHCP on (MAAS cannot see OVS-internal-port tags, so a plain OVS
+# internal port does not work). Each management VLAN is its own fabric, so
+# the topology fetcher classifies it management. The data VLAN has no
+# controller presence: it is L2-only between nodes and is modeled as its own
+# data fabric. The Juju controller stays on the untagged PXE segment and
+# reaches node agents by L3 routing through the testbed VM, so its MAC never
+# appears on these probed VLANs.
+vlans:
+  mgmt:
+    tag: 30
+    management: true
+    fabric: fabric-mgmt
+    cidr: 10.100.4.0/24
+    gateway: 10.100.4.1
+    dhcp_range: {start: 10.100.4.100, end: 10.100.4.200}
+  oam:
+    tag: 10
+    management: true
+    fabric: fabric-oam
+    cidr: 10.100.3.0/24
+    gateway: 10.100.3.1
+    dhcp_range: {start: 10.100.3.100, end: 10.100.3.200}
+  data:
+    tag: 100
+    fabric: nt-data
+    cidr: 10.100.2.0/24
 
 maas:
   # Snap channel for the maas snap; maas-test-db follows the same channel.
@@ -28,18 +63,44 @@ maas:
   admin_email: admin@nt-testbed.local
   vm_host_name: rack1-lxd
 
+# Node NICs: index 0 is the boot NIC. `vlan` names an entry in vlans above
+# (omit for the untagged PXE segment); `ip` is the STATIC address MAAS
+# assigns, required so the topology JSON carries peer IPs before deployment.
 racks:
   rack-1:
     nodes:
       - hostname: r1-data-01
+        role: data
         cpu: 2
         memory_mib: 2048
         disk_gib: 8
         nics:
           - bridge: br-rack1
+            vlan: mgmt
+            ip: 10.100.4.11
+          - bridge: br-rack1
+            vlan: data
+            ip: 10.100.2.11
       - hostname: r1-data-02
+        role: data
         cpu: 2
         memory_mib: 2048
         disk_gib: 8
         nics:
           - bridge: br-rack1
+            vlan: mgmt
+            ip: 10.100.4.12
+          - bridge: br-rack1
+            vlan: data
+            ip: 10.100.2.12
+      - hostname: r1-oam-01
+        role: bmc-oam
+        cpu: 1
+        # 1024 MiB is not enough to run the MAAS ephemeral image (it runs
+        # from RAM); commissioning stalls with the VM memory-exhausted.
+        memory_mib: 2048
+        disk_gib: 8
+        nics:
+          - bridge: br-rack1
+            vlan: oam
+            ip: 10.100.3.11

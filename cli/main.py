@@ -202,9 +202,9 @@ def _install_sigint_handler(model_holder):
     signal.signal(signal.SIGINT, handler)
 
 
-def _finish_run(collected, missing, verbose):
+def _finish_run(collected, missing, verbose, topology=None):
     report = report_generator.generate_report(
-        list(collected.values()), missing_nodes=missing, verbose=verbose
+        list(collected.values()), missing_nodes=missing, verbose=verbose, topology=topology
     )
     json_path, _text_path = report_generator.save_report(report)
     juju_run.log(f"report written to {json_path}")
@@ -216,7 +216,7 @@ async def _deploy_and_report(facade, args, topology, model_holder):
         facade, topology, args.charm, args.wait_timeout, cloud=args.cloud
     )
     model_holder["model"] = model_name
-    report = _finish_run(collected, missing, args.verbose)
+    report = _finish_run(collected, missing, args.verbose, topology=topology)
     if args.keep_model:
         print(
             f"Model {model_name} kept for inspection; run "
@@ -233,10 +233,10 @@ async def _deploy_and_report(facade, args, topology, model_holder):
 
 async def _reuse_and_report(facade, args, model_holder):
     model_holder["model"] = args.reuse_model
-    _topology, collected, missing, _warnings = await juju_run.run_reuse(
+    topology, collected, missing, _warnings = await juju_run.run_reuse(
         facade, args.reuse_model, args.wait_timeout
     )
-    report = _finish_run(collected, missing, args.verbose)
+    report = _finish_run(collected, missing, args.verbose, topology=topology)
     print(
         f"Model {args.reuse_model} kept (reuse mode); run "
         f"`juju destroy-model {args.reuse_model}` when done"
