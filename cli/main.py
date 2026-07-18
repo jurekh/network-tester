@@ -68,6 +68,12 @@ def build_parser():
         help="how long to wait for units (default: 600)",
     )
     run.add_argument(
+        "--probe-timeout",
+        type=int,
+        metavar="SECONDS",
+        help="override the charm probe-timeout for this run (default: charm config, 240)",
+    )
+    run.add_argument(
         "--verbose",
         action="store_true",
         help="include the full passed-checks list in the JSON report",
@@ -226,7 +232,12 @@ def _finish_run(collected, missing, verbose, topology=None, mac_manifest=None):
 
 async def _deploy_and_report(facade, args, topology, model_holder):
     model_name, collected, missing = await juju_run.run_new(
-        facade, topology, args.charm, args.wait_timeout, cloud=args.cloud
+        facade,
+        topology,
+        args.charm,
+        args.wait_timeout,
+        cloud=args.cloud,
+        probe_timeout=args.probe_timeout,
     )
     model_holder["model"] = model_name
     report = _finish_run(
@@ -253,7 +264,7 @@ async def _deploy_and_report(facade, args, topology, model_holder):
 async def _reuse_and_report(facade, args, model_holder):
     model_holder["model"] = args.reuse_model
     topology, collected, missing, _warnings = await juju_run.run_reuse(
-        facade, args.reuse_model, args.wait_timeout
+        facade, args.reuse_model, args.wait_timeout, probe_timeout=args.probe_timeout
     )
     report = _finish_run(
         collected,

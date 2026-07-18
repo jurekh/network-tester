@@ -186,8 +186,10 @@ def deploy_cli(argv, monkeypatch, tmp_path, keep=False):
     RecordingFacade.instances = []
     monkeypatch.setattr(cli_main.juju_run, "LibjujuFacade", RecordingFacade)
 
-    async def fake_run_new(facade, topology, charm_path, wait_timeout, cloud=None, poll=10):
-        fake_run_new.calls.append((charm_path, wait_timeout, cloud))
+    async def fake_run_new(
+        facade, topology, charm_path, wait_timeout, cloud=None, poll=10, probe_timeout=None
+    ):
+        fake_run_new.calls.append((charm_path, wait_timeout, cloud, probe_timeout))
         return "network-test-fake", {}, []
 
     fake_run_new.calls = []
@@ -204,7 +206,7 @@ def test_run_deploys_reports_and_destroys_model(capsys, monkeypatch, tmp_path):
         tmp_path,
     )
     assert code == 0
-    assert calls == [("nt.charm", 600, "maas-x")]
+    assert calls == [("nt.charm", 600, "maas-x", None)]
     facade = RecordingFacade.instances[0]
     assert facade.destroyed == ["network-test-fake"]
     assert facade.list_models_calls > 0  # waited for destruction to complete
@@ -212,6 +214,16 @@ def test_run_deploys_reports_and_destroys_model(capsys, monkeypatch, tmp_path):
     assert list(tmp_path.glob("network-test-*.json"))
     assert list(tmp_path.glob("network-test-*.txt"))
     assert "All 0 checks passed." in capsys.readouterr().out
+
+
+def test_run_threads_probe_timeout_to_run_new(monkeypatch, tmp_path):
+    code, calls = deploy_cli(
+        ["run", "--all", "--charm", "nt.charm", "--probe-timeout", "30", *MAAS_ARGS],
+        monkeypatch,
+        tmp_path,
+    )
+    assert code == 0
+    assert calls[0][3] == 30
 
 
 def test_run_keep_model_skips_destroy(capsys, monkeypatch, tmp_path):

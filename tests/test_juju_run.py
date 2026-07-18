@@ -183,6 +183,21 @@ def test_probe_run_id_set_once_after_units_ready():
     assert values["probe-run-id"]
 
 
+def test_probe_timeout_set_with_run_id_when_provided():
+    facade = FakeFacade()
+    run(run_new(facade, TOPOLOGY, "nt.charm", 60, poll=0, probe_timeout=30))
+    _, values = facade.config_calls[0]
+    assert values["probe-run-id"]
+    assert values["probe-timeout"] == "30"
+
+
+def test_probe_timeout_omitted_when_not_provided():
+    facade = FakeFacade()
+    run(run_new(facade, TOPOLOGY, "nt.charm", 60, poll=0))
+    _, values = facade.config_calls[0]
+    assert "probe-timeout" not in values
+
+
 def test_stuck_unit_recorded_as_probe_timeout():
     facade = FakeFacade(stuck_units={"network-tester/0"})
     _, collected, missing = run(run_new(facade, TOPOLOGY, "nt.charm", 0.2, poll=0))

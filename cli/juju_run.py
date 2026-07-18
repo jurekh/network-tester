@@ -104,15 +104,23 @@ def _probe_complete(run_id):
     return predicate
 
 
-async def _trigger_and_collect(facade, model_name, unit_machines, wait_deadline, missing, poll):
+async def _trigger_and_collect(
+    facade, model_name, unit_machines, wait_deadline, missing, poll, probe_timeout=None
+):
     """Set a fresh probe-run-id, wait for completion, collect results.
 
     unit_machines: {unit_name: machine record} for units eligible to probe.
-    Returns {unit_name: probe output document}; appends to missing.
+    When probe_timeout is set it is applied in the same config change as the
+    run-id so the triggered run uses it (the charm reads probe-timeout when it
+    launches the payload). Returns {unit_name: probe output document}; appends
+    to missing.
     """
     run_id = timestamp()
     log(f"triggering probe run {run_id} on {len(unit_machines)} unit(s)")
-    await facade.set_config(model_name, {"probe-run-id": run_id})
+    config = {"probe-run-id": run_id}
+    if probe_timeout is not None:
+        config["probe-timeout"] = str(probe_timeout)
+    await facade.set_config(model_name, config)
 
     done, stragglers = await wait_for_units(
         facade, model_name, unit_machines, wait_deadline, _probe_complete(run_id), poll=poll
@@ -149,7 +157,9 @@ async def _trigger_and_collect(facade, model_name, unit_machines, wait_deadline,
     return collected
 
 
-async def run_new(facade, topology, charm_path, wait_timeout, cloud=None, poll=10):
+async def run_new(
+    facade, topology, charm_path, wait_timeout, cloud=None, poll=10, probe_timeout=None
+):
     """Deploy, trigger, and collect a new probe run.
 
     Returns (model_name, collected outputs by unit, missing-node entries).
@@ -206,11 +216,12 @@ async def run_new(facade, topology, charm_path, wait_timeout, cloud=None, poll=1
             time.monotonic() + wait_timeout,
             missing,
             poll,
+            probe_timeout=probe_timeout,
         )
     return model_name, collected, missing
 
 
-async def run_reuse(facade, model_name, wait_timeout, poll=10):
+async def run_reuse(facade, model_name, wait_timeout, poll=10, probe_timeout=None):
     """Re-trigger probing on an existing model and collect results.
 
     Returns (topology, collected outputs by unit, missing entries, warnings).
@@ -253,7 +264,13 @@ async def run_reuse(facade, model_name, wait_timeout, poll=10):
         log(f"warning: {line}")
 
     collected = await _trigger_and_collect(
-        facade, model_name, restartable, time.monotonic() + wait_timeout, missing, poll
+        facade,
+        model_name,
+        restartable,
+        time.monotonic() + wait_timeout,
+        missing,
+        poll,
+        probe_timeout=probe_timeout,
     )
     return topology, collected, missing, warnings
 

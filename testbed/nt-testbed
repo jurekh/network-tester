@@ -2279,44 +2279,36 @@ def verify_timeout():
     problems = []
     deploy_args = f"--charm charm/{charm_name} --cloud {MAAS_CLOUD} --wait-timeout 2400"
 
-    log("verify timeout: clean deploy (model kept for the low-timeout re-trigger)")
-    result = network_tester_run(f"--all --keep-model {deploy_args}")
+    # A single run with a low --probe-timeout (set via the CLI, i.e. libjuju, so
+    # there is no juju-CLI model-cache dependency on a freshly created model).
+    log("verify timeout: deploy + probe with probe-timeout=30 (below the phase-1 floor)")
+    result = network_tester_run(f"--all --probe-timeout 30 --keep-model --verbose {deploy_args}")
     output = result.stdout + result.stderr
     match = re.search(r"Model (network-test-\S+) kept", output)
     model = match.group(1) if match else None
-    if model is None:
-        problems.append(f"deploy failed ({result.returncode}):\n{output}")
+    report = report_from_output(output)
+    if report is None:
+        problems.append(f"timeout run failed ({result.returncode}): no report:\n{output}")
     else:
-        log("verify timeout: setting probe-timeout=30 (below the phase-1 floor) and re-triggering")
-        vm_run(f"juju config -m {model} {JUJU_APP} probe-timeout=30")
-        result = network_tester_run(f"--reuse-model {model} --verbose --wait-timeout 1200")
-        out = result.stdout + result.stderr
-        report = report_from_output(out)
-        if report is None:
-            problems.append(f"timeout run: no report:\n{out}")
-        else:
-            inconclusive = [
-                e
-                for e in report.get("inconclusive_checks", [])
-                if e.get("type") == "bgp-reachability"
-            ]
-            if not inconclusive:
-                problems.append(
-                    "timeout run: expected unattempted cross-rack checks classified "
-                    "inconclusive:\n" + json.dumps(report.get("inconclusive_checks", []), indent=2)
-                )
-            failures = report.get("definitive_failures", []) + report.get("inferred_failures", [])
-            if failures:
-                problems.append(
-                    "timeout run: cross-rack timeout misclassified as failure:\n"
-                    + json.dumps(failures, indent=2)
-                )
-            if report.get("missing_nodes"):
-                problems.append(
-                    "timeout run: cross-rack timeout misclassified as missing nodes:\n"
-                    + json.dumps(report["missing_nodes"], indent=2)
-                )
-        vm_run(f"juju config -m {model} {JUJU_APP} probe-timeout=240", check=False)
+        inconclusive = [
+            e for e in report.get("inconclusive_checks", []) if e.get("type") == "bgp-reachability"
+        ]
+        if not inconclusive:
+            problems.append(
+                "timeout run: expected unattempted cross-rack checks classified "
+                "inconclusive:\n" + json.dumps(report.get("inconclusive_checks", []), indent=2)
+            )
+        failures = report.get("definitive_failures", []) + report.get("inferred_failures", [])
+        if failures:
+            problems.append(
+                "timeout run: cross-rack timeout misclassified as failure:\n"
+                + json.dumps(failures, indent=2)
+            )
+        if report.get("missing_nodes"):
+            problems.append(
+                "timeout run: cross-rack timeout misclassified as missing nodes:\n"
+                + json.dumps(report["missing_nodes"], indent=2)
+            )
 
     if model:
         log("verify timeout: destroying kept model")
