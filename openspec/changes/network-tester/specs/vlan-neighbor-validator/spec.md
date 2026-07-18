@@ -19,19 +19,23 @@ The vlan-neighbor-validator SHALL derive three peer sets from the topology befor
 - **WHEN** another machine in the topology shares the same fabric name and vlan_tag but is forbidden by the reachability model for this node role
 - **THEN** that machine SHALL be included in the known-forbidden peer set; if its MAC is observed, the validator SHALL record a definitive `forbidden-l2-neighbor` failure rather than a skipped observation
 
-### Requirement: Verify expected L2 neighbors via targeted ARP probes
-The vlan-neighbor-validator SHALL send one targeted `arping -I <iface> -c 1 -w 2 <peer-ip>` per expected in-scope peer, where `<iface>` is the interface on which that peer is expected (matching fabric name and vlan_tag). The `-I` flag is required to bind the probe to the correct interface on multi-homed nodes; without it the kernel routes the probe via the default route, which may be a different interface. All responding MAC addresses and IPs SHALL be recorded.
+### Requirement: Verify expected L2 neighbors via repeated targeted ARP sweeps
+The vlan-neighbor-validator SHALL probe every expected in-scope peer with targeted `arping -I <iface> -c 1 -w 2 <peer-ip>` sweeps that repeat every 5 seconds until the 30-second capture window closes, where `<iface>` is the interface on which that peer is expected (matching fabric name and vlan_tag). Within one sweep all peer probes SHALL run concurrently (spawned before any is reaped), so sweep wall time is bounded by a single probe timeout rather than the peer count. A peer counts as observed when any sweep's probe is answered. The sweep doubles as this node's transmission that concurrent observers passively classify: probe start times skew across units by a few seconds of hook dispatch, so a single burst at window-open would be invisible to an observer whose window opened slightly later or earlier. The `-I` flag is required to bind the probe to the correct interface on multi-homed nodes; without it the kernel routes the probe via the default route, which may be a different interface. All responding MAC addresses and IPs SHALL be recorded.
 
 #### Scenario: Expected neighbor responds to ARP
-- **WHEN** a node expected to be on the same VLAN responds to a targeted arping on the correct interface
+- **WHEN** a node expected to be on the same VLAN responds to a targeted arping on the correct interface during any sweep
 - **THEN** the validator SHALL record the neighbor's IP and MAC on that interface as observed
 
 #### Scenario: Expected neighbor absent from ARP responses
-- **WHEN** an expected peer does not respond to `arping -I <iface>` within 2 seconds
+- **WHEN** an expected peer does not respond to any sweep's `arping -I <iface>`
 - **THEN** the validator SHALL record a `missing-l2-neighbor` failure for that peer
 
+#### Scenario: Sweeps repeat across the capture window
+- **WHEN** the first sweep completes before the 30-second capture window has closed
+- **THEN** the validator SHALL run further sweeps at 5-second intervals until the window closes, keeping this node's ARP traffic visible to peers whose capture windows opened at a slightly different time
+
 ### Requirement: Detect unexpected L2 neighbors via passive ARP capture
-The vlan-neighbor-validator SHALL run `tcpdump -i <iface> arp -c 50 -w - --immediate-mode` on each active non-loopback interface concurrently with the targeted arping probes, for the duration of the arping phase (capped at 30 seconds). All source MAC addresses seen in ARP traffic during this window SHALL be cross-referenced against the expected in-scope, expected-but-out-of-scope, and known-forbidden topology for that interface. Any MAC absent from all known sets SHALL be recorded as an `unexpected-l2-neighbor` definitive failure. A MAC present only in the expected-but-out-of-scope set SHALL be recorded as a known skipped observation, not a failure. A MAC present in the known-forbidden set SHALL be recorded as a `forbidden-l2-neighbor` definitive failure.
+The vlan-neighbor-validator SHALL run `tcpdump -i <iface> arp -c 2000 -w - --immediate-mode` on each active non-loopback interface concurrently with the arping sweeps, held open for the full 30-second capture window. The packet cap is a memory bound only and SHALL be large enough that normal background ARP volume cannot exhaust it within the window (a cap reached early ends the capture and silently masks later traffic). All source MAC addresses seen in ARP traffic during this window SHALL be cross-referenced against the expected in-scope, expected-but-out-of-scope, and known-forbidden topology for that interface. Any MAC absent from all known sets SHALL be recorded as an `unexpected-l2-neighbor` definitive failure. A MAC present only in the expected-but-out-of-scope set SHALL be recorded as a known skipped observation, not a failure. A MAC present in the known-forbidden set SHALL be recorded as a `forbidden-l2-neighbor` definitive failure.
 
 #### Scenario: Unexpected neighbor seen in ARP traffic
 - **WHEN** a MAC address appears in passive ARP capture that is absent from both the expected in-scope peer set and the known out-of-scope peer set for that VLAN

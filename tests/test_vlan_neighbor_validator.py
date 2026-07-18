@@ -1,5 +1,7 @@
 """VLAN neighbor validator: peer derivation, ARP/ICMP probing, classification."""
 
+import json
+
 import probe_runner
 import vlan_neighbor_validator as vlan
 from conftest import FIXTURES, PING_OK, arp_pcap, load_fixture
@@ -112,8 +114,34 @@ def test_capture_runs_on_active_interface(fake_tools):
     fake_tools["ping3"][PEER_IP] = PING_OK
     run_validator()
     captures = [c for c in fake_tools["calls"] if c[0] == "tcpdump"]
-    expected = ["tcpdump", "-i", "eth0", "arp", "-c", "50", "-w", "-", "--immediate-mode"]
+    expected = ["tcpdump", "-i", "eth0", "arp", "-c", "2000", "-w", "-", "--immediate-mode"]
     assert captures == [expected]
+
+
+def test_sweep_arpings_all_peers_concurrently(fake_tools):
+    """One sweep spawns every peer's arping before reaping any of them, so
+    sweep wall time is bounded by the slowest single arping (-w 2), not the
+    sum over peers; cadence survives segments with many expected peers."""
+    topology = load_fixture(FIXTURES / "topology_mixed_scope.json")
+    peer = next(m for m in topology["machines"] if m["system_id"] == "aaa001")
+    extra = json.loads(json.dumps(peer))
+    extra["system_id"] = "aaa009"
+    extra["hostname"] = "r1-data-09"
+    extra["interfaces"][0]["mac"] = "52:54:00:01:09:01"
+    extra["interfaces"][0]["ip"] = "10.20.1.19"
+    topology["machines"].append(extra)
+    fake_tools["arp"][PEER_IP] = True
+    section = probe_runner.empty_section("vlan_neighbor_validator")
+    vlan.run(topology, NODE, section, probe_runner.Cancellation())
+    arpings = [c for c in fake_tools["calls"] if c[0] == "arping"]
+    assert sorted(c[-1] for c in arpings) == [PEER_IP, "10.20.1.19"]
+    # the unanswered peer is a missing-neighbor failure, the answered one is not
+    missing = [
+        f["details"]["peer_system_id"]
+        for f in section["findings"]
+        if f["type"] == "missing-l2-neighbor"
+    ]
+    assert missing == ["aaa009"]
 
 
 def test_missing_expected_peer_recorded_as_failure(fake_tools):

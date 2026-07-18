@@ -146,8 +146,12 @@ def parse_arp_pcap(data):
 
 
 def _start_capture(iface, cancellation):
+    # The packet cap is a memory bound, not a sampling budget: production
+    # VLANs can carry well over 50 ARP frames in a 30s window, and hitting
+    # the cap ends the capture early, silently masking unexpected neighbors
+    # that transmit later in the window.
     proc = subprocess.Popen(
-        ["tcpdump", "-i", iface, "arp", "-c", "50", "-w", "-", "--immediate-mode"],
+        ["tcpdump", "-i", iface, "arp", "-c", "2000", "-w", "-", "--immediate-mode"],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
     )
@@ -166,14 +170,19 @@ def _stop_capture(proc):
     return parse_arp_pcap(data or b"")
 
 
-def _arping(iface, ip, cancellation):
-    """One targeted ARP probe bound to the interface; True when answered."""
+def _arping_start(iface, ip, cancellation):
+    """Spawn one targeted ARP probe bound to the interface."""
     proc = subprocess.Popen(
         ["arping", "-I", iface, "-c", "1", "-w", "2", ip],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
     cancellation.register(proc)
+    return proc
+
+
+def _arping_wait(proc):
+    """True when the spawned arping was answered."""
     try:
         return proc.wait(timeout=10) == 0
     except subprocess.TimeoutExpired:
@@ -330,6 +339,11 @@ def run(topology, node, section, cancellation):
     arp_observed = {}
     interrupted = False
     while not interrupted:
+        # Spawn the whole sweep before reaping any probe: arpings run
+        # concurrently, so sweep wall time is bounded by one -w 2 probe
+        # rather than the sum over peers, and the sweep cadence survives
+        # segments with many expected peers.
+        sweep = []
         for plan in plans:
             for peer in plan["expected"]:
                 if cancellation.is_set() or time.monotonic() - phase_start > CAPTURE_CAP_SECONDS:
@@ -337,10 +351,12 @@ def run(topology, node, section, cancellation):
                     break
                 key = (plan["interface"], peer["system_id"])
                 attempted.add(key)
-                answered = _arping(plan["local_iface"], peer["ip"], cancellation)
-                arp_observed[key] = arp_observed.get(key, False) or answered
+                sweep.append((key, _arping_start(plan["local_iface"], peer["ip"], cancellation)))
             if interrupted:
                 break
+        for key, proc in sweep:
+            answered = _arping_wait(proc)
+            arp_observed[key] = arp_observed.get(key, False) or answered
         if interrupted:
             break
         remaining = CAPTURE_WINDOW_SECONDS - (time.monotonic() - phase_start)
