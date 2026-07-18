@@ -384,6 +384,13 @@ def ensure_maas():
         )
     if not vm_ok(f"maas list | grep -q '^{user} '"):
         vm_run(f'maas login {user} {MAAS_URL} "$(maas apikey --username {user})"')
+    # MAAS bind9 serves DNS to the PXE segment: the Juju controller and the
+    # deployed nodes resolve through it. Pin an explicit upstream forwarder and
+    # disable DNSSEC so external names (apt mirrors) resolve. Auto-recursion can
+    # SERVFAIL or time out in the nested testbed, which silently hangs apt during
+    # Juju bootstrap and node deploys (the failure looks like a stuck bootstrap).
+    vm_run(f"maas {user} maas set-config name=upstream_dns value='1.1.1.1 8.8.8.8'", check=False)
+    vm_run(f"maas {user} maas set-config name=dnssec_validation value=no", check=False)
     log("MAAS is initialised and the admin profile is logged in")
 
 
