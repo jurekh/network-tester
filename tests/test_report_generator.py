@@ -306,3 +306,78 @@ def test_non_representative_skips_create_no_coverage_gaps():
     ]
     # aaa002's skipped cross-rack sections add nothing to skips either
     assert {e["peer"] for e in report["skipped_checks"]} == {"aaa003", "bbb001"}
+
+
+# --- MAC manifest symmetric swap detection (6.10) ----------------------------------
+
+
+def _bond_pdu(switch="aa:bb:cc:dd:ee:01", port=1):
+    return {
+        "actor_system_id": switch,
+        "actor_port_key": 1,
+        "actor_port": port,
+        "actor_state": {"active": True},
+        "partner_system_id": "00:00:00:00:00:00",
+        "partner_port_key": 0,
+        "partner_state": {"active": False},
+    }
+
+
+def _bond_doc(member_pdus, interfaces):
+    members = [
+        {"interface": iface, "lacp_advertised": bool(pdus), "pdus": pdus}
+        for iface, pdus in member_pdus.items()
+    ]
+    return {
+        "schema_version": "1",
+        "status": "complete",
+        "node": {"system_id": "aaa001", "hostname": "r1-data-01", "interfaces": interfaces},
+        "bond_validator": {
+            "validator_status": "complete",
+            "findings": [],
+            "bonds": [{"bond": "bond0", "members": members}],
+        },
+        "vlan_neighbor_validator": {
+            "validator_status": "complete",
+            "findings": [],
+            "observations": [],
+        },
+        "mtu_validator": {"validator_status": "not_started", "findings": [], "cross_rack_mtu": []},
+        "bgp_inference": {"validator_status": "not_started", "findings": [], "paths": []},
+    }
+
+
+IFACES = [
+    {"name": "eno1", "mac": "52:54:00:01:01:01"},
+    {"name": "eno2", "mac": "52:54:00:01:01:02"},
+]
+
+
+def test_mac_manifest_flags_symmetric_swap():
+    out = _bond_doc({"eno1": [_bond_pdu(port=1)]}, IFACES)
+    # the manifest says port aa:bb:cc:dd:ee:01:1 should carry eno2's MAC, but
+    # eno1 (a different MAC) was observed there -> swapped cabling.
+    manifest = {"ports": {"aa:bb:cc:dd:ee:01:1": "52:54:00:01:01:02"}}
+    report = report_generator.generate_report([out], mac_manifest=manifest)
+    swaps = [o for o in report["observations"] if o["type"] == "symmetric-bond-swap"]
+    assert len(swaps) == 1
+    assert swaps[0]["classification"] == "informational"
+    assert swaps[0]["expected_mac"] == "52:54:00:01:01:02"
+    assert swaps[0]["observed_mac"] == "52:54:00:01:01:01"
+    assert swaps[0]["node"] == "r1-data-01"
+    # informational findings do not change the exit code
+    assert report_generator.exit_code(report) == 0
+    assert schemas.validate_report(report) == []
+
+
+def test_mac_manifest_no_swap_when_observed_matches_expected():
+    out = _bond_doc({"eno1": [_bond_pdu(port=1)]}, IFACES)
+    manifest = {"ports": {"aa:bb:cc:dd:ee:01:1": "52:54:00:01:01:01"}}
+    report = report_generator.generate_report([out], mac_manifest=manifest)
+    assert [o for o in report["observations"] if o["type"] == "symmetric-bond-swap"] == []
+
+
+def test_no_manifest_skips_swap_detection():
+    out = _bond_doc({"eno1": [_bond_pdu(port=1)]}, IFACES)
+    report = report_generator.generate_report([out])
+    assert [o for o in report["observations"] if o["type"] == "symmetric-bond-swap"] == []

@@ -2,8 +2,10 @@
 
 import argparse
 import asyncio
+import json
 import signal
 import sys
+from pathlib import Path
 
 from cli import juju_run, maas_topology, report_generator, representatives
 
@@ -202,9 +204,20 @@ def _install_sigint_handler(model_holder):
     signal.signal(signal.SIGINT, handler)
 
 
-def _finish_run(collected, missing, verbose, topology=None):
+def _load_mac_manifest(path):
+    """Load the optional MAC-to-port manifest read locally on the workstation."""
+    if not path:
+        return None
+    return json.loads(Path(path).read_text())
+
+
+def _finish_run(collected, missing, verbose, topology=None, mac_manifest=None):
     report = report_generator.generate_report(
-        list(collected.values()), missing_nodes=missing, verbose=verbose, topology=topology
+        list(collected.values()),
+        missing_nodes=missing,
+        verbose=verbose,
+        topology=topology,
+        mac_manifest=mac_manifest,
     )
     json_path, _text_path = report_generator.save_report(report)
     juju_run.log(f"report written to {json_path}")
@@ -216,7 +229,13 @@ async def _deploy_and_report(facade, args, topology, model_holder):
         facade, topology, args.charm, args.wait_timeout, cloud=args.cloud
     )
     model_holder["model"] = model_name
-    report = _finish_run(collected, missing, args.verbose, topology=topology)
+    report = _finish_run(
+        collected,
+        missing,
+        args.verbose,
+        topology=topology,
+        mac_manifest=_load_mac_manifest(args.mac_manifest),
+    )
     if args.keep_model:
         print(
             f"Model {model_name} kept for inspection; run "
@@ -236,7 +255,13 @@ async def _reuse_and_report(facade, args, model_holder):
     topology, collected, missing, _warnings = await juju_run.run_reuse(
         facade, args.reuse_model, args.wait_timeout
     )
-    report = _finish_run(collected, missing, args.verbose, topology=topology)
+    report = _finish_run(
+        collected,
+        missing,
+        args.verbose,
+        topology=topology,
+        mac_manifest=_load_mac_manifest(args.mac_manifest),
+    )
     print(
         f"Model {args.reuse_model} kept (reuse mode); run "
         f"`juju destroy-model {args.reuse_model}` when done"

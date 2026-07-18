@@ -69,6 +69,39 @@ def arp_pcap(*entries):
     return b"".join(chunks)
 
 
+def lacp_pcap(*pdus):
+    """Synthesize pcap bytes with one LACP frame (EtherType 0x8809) per pdu.
+
+    Each pdu is a dict; actor_system_id is required, the rest default to
+    plausible values. actor_state defaults to 0x3d (LACP active + aggregation
+    + sync + collecting + distributing).
+    """
+    chunks = [struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1)]
+    for p in pdus:
+        eth = mac_bytes("01:80:c2:00:00:02") + mac_bytes(p["actor_system_id"]) + b"\x88\x09"
+        body = struct.pack(">BB", 1, 1)  # subtype LACP, version 1
+        body += struct.pack(">BBH", 1, 0x14, p.get("actor_sys_prio", 65535))
+        body += mac_bytes(p["actor_system_id"])
+        body += struct.pack(
+            ">HHH", p.get("actor_key", 1), p.get("actor_port_prio", 255), p.get("actor_port", 1)
+        )
+        body += struct.pack(">B", p.get("actor_state", 0x3D)) + b"\x00\x00\x00"
+        body += struct.pack(">BBH", 2, 0x14, p.get("partner_sys_prio", 0))
+        body += mac_bytes(p.get("partner_system_id", "00:00:00:00:00:00"))
+        body += struct.pack(
+            ">HHH",
+            p.get("partner_key", 0),
+            p.get("partner_port_prio", 0),
+            p.get("partner_port", 0),
+        )
+        body += struct.pack(">B", p.get("partner_state", 0)) + b"\x00\x00\x00"
+        body += struct.pack(">BBH", 3, 0x10, 0) + b"\x00" * 12  # collector TLV
+        body += b"\x00\x00" + b"\x00" * 50  # terminator TLV + padding to min frame size
+        frame = eth + body
+        chunks.append(struct.pack("<IIII", 0, 0, len(frame), len(frame)) + frame)
+    return b"".join(chunks)
+
+
 class FakeProc:
     def __init__(self, cmd, returncode=0, out=b""):
         self.cmd = cmd

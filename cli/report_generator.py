@@ -248,8 +248,56 @@ def _classify_cross_rack(report, topology, by_sid, passed):
                 )
 
 
+def _classify_mac_manifest(report, manifest, by_sid):
+    """Cross-reference observed switch-port MACs against the MAC manifest.
+
+    The manifest maps a switch port (``<actor_system_id>:<actor_port>`` from
+    the captured LACP PDU) to the host member MAC expected on that port. When a
+    bond member's observed MAC differs from the manifest entry for the switch
+    port it landed on, the cable is swapped relative to the design. This is an
+    informational finding, not a failure: asymmetric swaps are already caught
+    definitively by the bond-validator; the manifest catches symmetric swaps
+    that LACP PDU comparison alone cannot see.
+    """
+    ports = manifest.get("ports", manifest)
+    for output in by_sid.values():
+        node = output["node"]
+        mac_by_iface = {
+            iface["name"]: iface.get("mac", "").lower() for iface in node.get("interfaces", [])
+        }
+        section = output.get("bond_validator") or {}
+        for bond in section.get("bonds", []):
+            for member in bond.get("members", []):
+                pdus = member.get("pdus") or []
+                if not pdus:
+                    continue
+                pdu = pdus[0]
+                port_id = f"{pdu['actor_system_id']}:{pdu['actor_port']}"
+                if port_id not in ports:
+                    continue
+                expected = ports[port_id].lower()
+                observed = mac_by_iface.get(member["interface"], "")
+                if observed and observed != expected:
+                    report["observations"].append(
+                        {
+                            "type": "symmetric-bond-swap",
+                            "classification": "informational",
+                            "node": node["hostname"],
+                            "interface": member["interface"],
+                            "switch_port": port_id,
+                            "expected_mac": expected,
+                            "observed_mac": observed,
+                        }
+                    )
+
+
 def generate_report(
-    probe_outputs, missing_nodes=(), verbose=False, topology=None, now=time.localtime
+    probe_outputs,
+    missing_nodes=(),
+    verbose=False,
+    topology=None,
+    mac_manifest=None,
+    now=time.localtime,
 ):
     """Build the report document from collected per-unit probe outputs.
 
@@ -299,10 +347,12 @@ def generate_report(
             }
         )
     passed = []
+    by_sid = {output["node"]["system_id"]: output for output in probe_outputs}
     if topology is not None:
-        by_sid = {output["node"]["system_id"]: output for output in probe_outputs}
         _classify_vlan_edges(report, topology, by_sid, passed)
         _classify_cross_rack(report, topology, by_sid, passed)
+    if mac_manifest is not None:
+        _classify_mac_manifest(report, mac_manifest, by_sid)
     report["summary"] = {
         "passed_count": len(passed),
         "failed": len(report["definitive_failures"]),

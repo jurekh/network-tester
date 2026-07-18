@@ -116,6 +116,45 @@ def nic_cidr(nic):
     return VLANS[nic["vlan"]]["cidr"] if nic.get("vlan") else PXE["cidr"]
 
 
+def node_bond(node):
+    """The bond descriptor for a node, or None when it has no bond."""
+    return node.get("bond")
+
+
+def bond_member_devices(node):
+    """Guest NIC device names that are bond members, in order.
+
+    Members are added after the configured NICs, so for a data node with one
+    boot NIC (eth0) and a two-member bond the members are eth1 and eth2.
+    """
+    bond = node_bond(node)
+    if not bond:
+        return []
+    base = len(node.get("nics", []))
+    return [f"eth{base + j}" for j in range(bond["members"])]
+
+
+def expected_physical_nics(node):
+    """Total physical NICs MAAS should record for a node (NICs + bond members)."""
+    return len(node.get("nics", [])) + len(bond_member_devices(node))
+
+
+def ovs_bond_name(host):
+    """Host-side OVS bond port name aggregating a node's member NICs."""
+    return f"ob-{host}"
+
+
+def swap_extra_names(host):
+    """Names for the bond-swap fault's wrong-switch bond and its pad netdevs.
+
+    The pad interfaces are real netdevs, so their names must fit the 15-char
+    kernel limit; derive a short per-node suffix from the hostname digits.
+    """
+    digits = re.findall(r"\d+", host)
+    suffix = digits[-1] if digits else "0"
+    return {"wrong": f"obw{suffix}", "pad_a": f"obpa{suffix}", "pad_b": f"obpb{suffix}"}
+
+
 def inner_nic_devices(host):
     """NIC devices of an inner LXD instance: name -> device dict with hwaddr."""
     raw = vm_out(f"lxc config show {host} --expanded", check=False)
@@ -152,9 +191,16 @@ def vm_exists():
     return any(i["name"] == VM for i in json.loads(result.stdout))
 
 
+# Set when `up` (re)starts a pre-existing VM rather than launching a fresh one.
+# A restart recreates the bridge VLAN subinterfaces, leaving MAAS's dhcpd bound
+# to the old ones until it is restarted (see ensure_dhcp_rebind).
+_STATE = {"vm_restarted": False}
+
+
 def ensure_vm():
     if vm_exists():
         log(f"VM {VM} already exists")
+        _STATE["vm_restarted"] = True
         host_run(["lxc", "start", VM], check=False, capture=True)
     else:
         cfg = CONFIG["vm"]
@@ -253,6 +299,27 @@ def ensure_maas():
     if not vm_ok(f"maas list | grep -q '^{user} '"):
         vm_run(f'maas login {user} {MAAS_URL} "$(maas apikey --username {user})"')
     log("MAAS is initialised and the admin profile is logged in")
+
+
+def ensure_dhcp_rebind():
+    """After a VM restart, restart MAAS so dhcpd rebinds to the VLAN subinterfaces.
+
+    Restarting the VM recreates br-rack1.<tag>; the persisted dhcpd stays bound
+    to the old interface instances and silently stops answering PXE DHCP, so
+    node deploys fall through to the stale on-disk image and never reinstall.
+    Restarting MAAS rebinds dhcpd. Only needed on a restart of an already-built
+    testbed, so it is skipped on a fresh bring-up.
+    """
+    if not _STATE["vm_restarted"]:
+        return
+    log("VM was restarted; restarting MAAS to rebind dhcpd to the VLAN subinterfaces")
+    vm_run("snap restart maas")
+    wait_for(
+        "MAAS API",
+        lambda: vm_ok(f"curl -fsS {MAAS_URL}/api/2.0/version/ >/dev/null"),
+        timeout=300,
+        interval=10,
+    )
 
 
 def ensure_subnet_dhcp():
@@ -557,11 +624,28 @@ def ensure_node_networking():
                 f"nictype=bridged parent={nic['bridge']}{tag_arg}"
             )
             changed = True
+        # Bond member NICs attach untagged to the bridge; the OVS bond
+        # (the OVS bond) carries the VLAN tag and runs LACP, so the tag must
+        # not also sit on the access port.
+        for device in bond_member_devices(node):
+            if device in devices:
+                # A member that previously served as a tagged access NIC must
+                # drop its VLAN tag: the OVS bond now carries the tag.
+                if devices[device].get("vlan"):
+                    log(f"{host}: clearing VLAN tag on bond member {device}")
+                    vm_run(f"lxc config device unset {host} {device} vlan")
+                    changed = True
+                continue
+            log(f"{host}: adding bond member NIC {device} on {PXE['bridge']}")
+            vm_run(
+                f"lxc config device add {host} {device} nic nictype=bridged parent={PXE['bridge']}"
+            )
+            changed = True
         machine = machines.get(host)
         if machine is None:
             fatal(f"MAAS has no machine named {host}")
         physical = [i for i in machine["interface_set"] if i.get("type") == "physical"]
-        if changed or len(physical) < len(nics_cfg):
+        if changed or len(physical) < expected_physical_nics(node):
             to_commission.append(host)
     for host in to_commission:
         machine = machines[host]
@@ -622,6 +706,238 @@ def ensure_addressing():
                 f"mode=STATIC subnet={subnet['id']} ip_address={ip}"
             )
             log(f"{host} {interface['name']}: STATIC {ip} on {subnet['cidr']}")
+
+
+def _bond_member_ports(node):
+    """Host-side OVS port names backing a node's bond member NICs."""
+    host = node["hostname"]
+    ports = []
+    for device in bond_member_devices(node):
+        port = vm_out(f"lxc config get {host} volatile.{device}.host_name", check=False)
+        if not port:
+            fatal(f"{host} {device} has no host-side port; is the instance running?")
+        ports.append(port)
+    return ports
+
+
+BOND_RECONCILER_PATH = "/usr/local/sbin/nt-bond-reconciler"
+BOND_RECONCILER_CONFIG = "/etc/nt-bond-reconciler.json"
+BOND_PAUSE_FLAG = "/run/nt-bond-pause"
+
+# The reconciler runs inside the testbed VM and keeps each data node's two
+# member veths aggregated into its OVS LACP bond. It is needed because MAAS
+# powers nodes off in the Ready state: the host-side veths only exist while a
+# node is deployed and running, and LXD assigns them fresh random names on
+# every boot, so the bond cannot be created once at `up` time. The pause flag
+# lets fault injection modify a bond without the reconciler reverting it.
+BOND_RECONCILER_SCRIPT = r"""#!/usr/bin/env python3
+import json
+import os
+import re
+import subprocess
+import time
+
+CONFIG = "/etc/nt-bond-reconciler.json"
+PAUSE = "/run/nt-bond-pause"
+
+
+def sh(cmd):
+    return subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+
+def host_name(host, dev):
+    return sh(f"lxc config get {host} volatile.{dev}.host_name").stdout.strip()
+
+
+def bond_ifaces(bond):
+    # bond/show lists "member <iface>:" lines; list-ifaces is bridge-only and
+    # would error on a bond port every cycle, causing a needless rebuild that
+    # flaps the taps and prevents LACP from converging. An absent bond yields
+    # no members, which correctly forces a (re)build.
+    out = sh(f"ovs-appctl bond/show {bond}").stdout
+    return set(re.findall(r"^member (\S+):", out, re.M))
+
+
+def fix_guest_nic_speed(host):
+    # 802.3ad bonding needs a known link speed/duplex to aggregate, but virtio
+    # NICs report "Speed: Unknown", so the guest marks its bond members down
+    # and never sends LACP. Force a fixed speed/duplex on any bond slave whose
+    # speed is unknown (best-effort; only when the node is booted enough to
+    # exec). Idempotent: skips members that already have a speed, so it does
+    # not flap an established bond.
+    script = (
+        "for s in /sys/class/net/*/bonding/slaves; do "
+        'for i in $(cat "$s" 2>/dev/null); do '
+        'ethtool "$i" 2>/dev/null | grep -q "Speed: Unknown" && '
+        'ethtool -s "$i" speed 1000 duplex full; done; done'
+    )
+    sh("lxc exec " + host + " -- bash -c '" + script + "'")
+
+
+def reconcile(cfg):
+    bridge = cfg["bridge"]
+    for node in cfg["nodes"]:
+        members = [host_name(node["host"], dev) for dev in node["members"]]
+        if not all(members):
+            continue
+        if not all(sh(f"ip link show {m}").returncode == 0 for m in members):
+            continue
+        name, tag = node["ovs_bond"], node["tag"]
+        if bond_ifaces(name) != set(members):
+            sh(f"ovs-vsctl --if-exists del-port {bridge} {name}")
+            for m in members:
+                sh(f"ovs-vsctl --if-exists del-port {bridge} {m}")
+            sh(
+                f"ovs-vsctl add-bond {bridge} {name} {' '.join(members)} "
+                f"bond_mode=balance-tcp lacp=active other_config:lacp-time=slow tag={tag}"
+            )
+        fix_guest_nic_speed(node["host"])
+
+
+def main():
+    while True:
+        if not os.path.exists(PAUSE):
+            try:
+                cfg = json.load(open(CONFIG))
+                reconcile(cfg)
+            except Exception:
+                pass
+        time.sleep(10)
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+def build_ovs_bond(node):
+    """(Re)build a node's unified OVS LACP bond from its running member veths."""
+    bridge = PXE["bridge"]
+    name = ovs_bond_name(node["hostname"])
+    tag = VLANS[node_bond(node)["vlan"]]["tag"]
+    ports = _bond_member_ports(node)
+    for extra in swap_extra_names(node["hostname"]).values():
+        vm_run(f"ovs-vsctl --if-exists del-port {bridge} {extra}", check=False)
+    vm_run(f"ovs-vsctl --if-exists del-port {bridge} {name}")
+    for port in ports:
+        vm_run(f"ovs-vsctl --if-exists del-port {bridge} {port}")
+    vm_run(
+        f"ovs-vsctl add-bond {bridge} {name} {' '.join(ports)} "
+        f"bond_mode=balance-tcp lacp=active other_config:lacp-time=slow tag={tag}"
+    )
+    log(f"{node['hostname']}: OVS bond {name} over {ports} (LACP active/slow, VLAN {tag})")
+
+
+def ensure_bond_reconciler():
+    """Install and start the in-VM OVS bond reconciler service.
+
+    The data nodes' OVS bonds cannot be created at `up` time (the nodes are
+    powered off in Ready), so a small systemd service inside the VM aggregates
+    each node's member veths into its bond whenever they appear after a deploy.
+    """
+    bonded = [n for n in expected_nodes() if node_bond(n)]
+    if not bonded:
+        return
+    config = {
+        "bridge": PXE["bridge"],
+        "nodes": [
+            {
+                "host": n["hostname"],
+                "ovs_bond": ovs_bond_name(n["hostname"]),
+                "tag": VLANS[node_bond(n)["vlan"]]["tag"],
+                "members": bond_member_devices(n),
+            }
+            for n in bonded
+        ],
+    }
+    vm_run(f"cat > {BOND_RECONCILER_CONFIG} <<'NTEOF'\n{json.dumps(config, indent=2)}\nNTEOF")
+    vm_run(f"cat > {BOND_RECONCILER_PATH} <<'NTEOF'\n{BOND_RECONCILER_SCRIPT}\nNTEOF")
+    vm_run(f"chmod +x {BOND_RECONCILER_PATH}")
+    unit = (
+        "[Unit]\nDescription=nt-testbed OVS bond reconciler\n\n"
+        f"[Service]\nExecStart=/usr/bin/python3 {BOND_RECONCILER_PATH}\nRestart=always\n\n"
+        "[Install]\nWantedBy=multi-user.target\n"
+    )
+    vm_run(f"cat > /etc/systemd/system/nt-bond-reconciler.service <<'NTEOF'\n{unit}\nNTEOF")
+    vm_run(f"rm -f {BOND_PAUSE_FLAG}")
+    vm_run("systemctl daemon-reload && systemctl enable --now nt-bond-reconciler.service")
+    vm_run("systemctl restart nt-bond-reconciler.service")
+    log("OVS bond reconciler service installed and running")
+
+
+def ensure_maas_bonds():
+    """Create the matching MAAS 802.3ad bond over each node's member NICs.
+
+    The members commission as plain physical interfaces (the data VLAN has no
+    DHCP or LLDP, so MAAS leaves them on the default fabric). This step bonds
+    them in MAAS with mode 802.3ad / slow LACP rate, moves the bond onto the
+    data VLAN, and assigns the STATIC data IP so the topology JSON carries the
+    bond before deployment. Idempotent: an existing bond with the right
+    address is left untouched, so it also serves as a fault-clear restore.
+    """
+    subnets = {s["cidr"]: s for s in maas_json("subnets read")}
+    machines = {m["hostname"]: m for m in maas_json("machines read")}
+    for node in expected_nodes():
+        bond = node_bond(node)
+        if not bond:
+            continue
+        host = node["hostname"]
+        machine = machines.get(host)
+        if machine is None:
+            fatal(f"MAAS has no machine named {host}")
+        sysid = machine["system_id"]
+        devices = inner_nic_devices(host)
+        member_macs = [devices[d]["hwaddr"] for d in bond_member_devices(node) if d in devices]
+        by_mac = {
+            (i.get("mac_address") or "").lower(): i
+            for i in machine["interface_set"]
+            if i.get("type") == "physical"
+        }
+        members = [by_mac[m] for m in member_macs if m in by_mac]
+        if len(members) != len(bond_member_devices(node)):
+            fatal(f"{host}: MAAS missing physical interfaces for bond members; recommission")
+        subnet = subnets[VLANS[bond["vlan"]]["cidr"]]
+        bond_iface = next(
+            (
+                i
+                for i in machine["interface_set"]
+                if i.get("type") == "bond" and i["name"] == bond["name"]
+            ),
+            None,
+        )
+        if bond_iface is None:
+            # MAAS requires bond parents to share a VLAN and carry no subnet
+            # links. The untagged members commission onto separate auto-created
+            # fabrics, so move both onto the data VLAN and drop their links
+            # before bonding (a member may also have been a tagged data NIC
+            # before this stage).
+            for member in members:
+                # Unlink first: changing the VLAN invalidates the link ids.
+                for link in _addressed_links(member):
+                    maas_json(f"interface unlink-subnet {sysid} {member['id']} id={link['id']}")
+                if (member.get("vlan") or {}).get("id") != subnet["vlan"]["id"]:
+                    maas_json(
+                        f"interface update {sysid} {member['id']} vlan={subnet['vlan']['id']}"
+                    )
+            parents = " ".join(f"parents={i['id']}" for i in members)
+            member_names = [i["name"] for i in members]
+            log(f"{host}: creating MAAS bond {bond['name']} (802.3ad) over {member_names}")
+            bond_iface = maas_json(
+                f"interfaces create-bond {sysid} name={bond['name']} {parents} "
+                f"bond_mode={bond['mode']} bond_lacp_rate=slow"
+            )
+        if (bond_iface.get("vlan") or {}).get("id") != subnet["vlan"]["id"]:
+            maas_json(f"interface update {sysid} {bond_iface['id']} vlan={subnet['vlan']['id']}")
+        links = _addressed_links(bond_iface)
+        if len(links) == 1 and links[0].get("ip_address") == bond["ip"]:
+            continue
+        for link in links:
+            maas_json(f"interface unlink-subnet {sysid} {bond_iface['id']} id={link['id']}")
+        maas_json(
+            f"interface link-subnet {sysid} {bond_iface['id']} "
+            f"mode=STATIC subnet={subnet['id']} ip_address={bond['ip']}"
+        )
+        log(f"{host} {bond['name']}: STATIC {bond['ip']} on {subnet['cidr']}")
 
 
 JUJU_CONTROLLER = "nt"
@@ -774,11 +1090,14 @@ def cmd_up():
     # exists, so the rack-controller refresh runs against a clean interface
     # set (no churning node taps) when the VLAN ports are added.
     ensure_vlan_networks()
+    ensure_dhcp_rebind()
     ensure_data_segments()
     ensure_inner_lxd()
     ensure_vm_host()
     ensure_machines()
     ensure_node_networking()
+    ensure_maas_bonds()
+    ensure_bond_reconciler()
     ensure_addressing()
     sync_tree()
     ensure_juju()
@@ -1176,11 +1495,146 @@ def verify_vlan():
     log("verify vlan: PASS (clean, wrong-vlan fault, partial scope)")
 
 
+def unit_probe_outputs(model):
+    """Cat /var/log/network-tester/probe-output.json from every unit, keyed by
+    the reporting node's hostname. Used to inspect raw bond audit data the
+    report does not surface."""
+    raw = vm_out(f"juju status -m {model} --format json", check=False)
+    outputs = {}
+    if not raw:
+        return outputs
+    data = json.loads(raw)
+    for app in (data.get("applications") or {}).values():
+        for unit in app.get("units") or {}:
+            text = vm_out(
+                f"juju exec -m {model} --unit {unit} -- "
+                "cat /var/log/network-tester/probe-output.json",
+                check=False,
+            )
+            try:
+                doc = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            host = (doc.get("node") or {}).get("hostname")
+            if host:
+                outputs[host] = doc
+    return outputs
+
+
+def _check_clean_bonds(outputs, bonded, problems):
+    """Assert each bonded node reports bond_mode/bond_cabling pass and that at
+    least one member captured an LACP PDU in the 35s window (6.12 empirical)."""
+    for host in bonded:
+        doc = outputs.get(host)
+        if doc is None:
+            problems.append(f"no probe output collected for bonded node {host}")
+            continue
+        bonds = (doc.get("bond_validator") or {}).get("bonds") or []
+        if not bonds:
+            problems.append(f"{host}: bond_validator recorded no bonds")
+            continue
+        bond = bonds[0]
+        if bond.get("bond_mode") != "pass":
+            problems.append(
+                f"{host}: bond_mode is {bond.get('bond_mode')}, expected pass:\n"
+                + json.dumps(bond, indent=2)
+            )
+        if bond.get("bond_cabling") != "pass":
+            problems.append(f"{host}: bond_cabling is {bond.get('bond_cabling')}, expected pass")
+        if not any(m.get("lacp_advertised") for m in bond.get("members", [])):
+            problems.append(
+                f"{host}: no bond member captured an LACP PDU in the 35s window (6.12):\n"
+                + json.dumps(bond, indent=2)
+            )
+
+
+# (fault name, expected report finding type, required hint substring)
+BOND_FAULT_CASES = (
+    ("bond-static", "bond-mode-mismatch", "static bonding"),
+    ("bond-passive", "bond-mode-mismatch", "lacp_active off"),
+    ("bond-swap", "asymmetric-bond-cable", "different switches"),
+)
+
+
+def verify_bond():
+    """Stage 6 gate: clean LACP pass plus the three bond fault scenarios.
+
+    The clean run confirms the validator captures real LACP PDUs from the OVS
+    bond (6.12) and reports bond mode and cabling as pass. Each fault is then
+    injected on the kept model and re-triggered via --reuse-model, asserting
+    the expected finding type and remediation hint appear in the report.
+    """
+    charm_name = ensure_charm_packed()
+    sync_tree()
+    ensure_juju()
+    destroy_test_models()
+    clear_faults()
+    problems = []
+    deploy_args = f"--charm charm/{charm_name} --cloud {MAAS_CLOUD} --wait-timeout 1800"
+    bonded = [n["hostname"] for n in expected_nodes() if node_bond(n)]
+
+    log("verify bond: clean run (model kept for the fault re-triggers)")
+    result = network_tester_run(f"--all --keep-model {deploy_args}")
+    output = result.stdout + result.stderr
+    match = re.search(r"Model (network-test-\S+) kept", output)
+    report = report_from_output(output)
+    model = match.group(1) if match else None
+    if result.returncode != 0 or model is None or report is None:
+        problems.append(f"clean run failed ({result.returncode}):\n{output}")
+    else:
+        bond_failures = [
+            f
+            for f in report["definitive_failures"]
+            if f["type"] in ("bond-mode-mismatch", "asymmetric-bond-cable")
+        ]
+        if bond_failures:
+            problems.append("clean run has bond failures:\n" + json.dumps(bond_failures, indent=2))
+        _check_clean_bonds(unit_probe_outputs(model), bonded, problems)
+
+    if not problems and model:
+        target = bonded[0]
+        for fault_name, ftype, hint in BOND_FAULT_CASES:
+            log(f"verify bond: {fault_name} fault on {target}")
+            cmd_fault(fault_name, [target])
+            result = network_tester_run(f"--reuse-model {model} --wait-timeout 900")
+            out = result.stdout + result.stderr
+            rep = report_from_output(out)
+            if rep is None:
+                problems.append(f"{fault_name} run produced no report:\n{out}")
+            else:
+                matching = [
+                    f
+                    for f in rep["definitive_failures"]
+                    if f["type"] == ftype and f.get("node") == target and hint in f.get("hint", "")
+                ]
+                if not matching:
+                    problems.append(
+                        f"{fault_name}: no {ftype} finding for {target} with hint "
+                        f"'{hint}':\n" + json.dumps(rep["definitive_failures"], indent=2)
+                    )
+                if result.returncode != 1:
+                    problems.append(f"{fault_name} run exited {result.returncode}, expected 1")
+            log(f"verify bond: clearing {fault_name}")
+            clear_faults()
+
+    if model:
+        log("verify bond: destroying kept model")
+        vm_run(f"juju destroy-model --no-prompt --force --timeout 15m {model}", check=False)
+        wait_nodes_ready()
+
+    if problems:
+        for problem in problems:
+            log(f"FAIL: {problem}")
+        sys.exit(1)
+    log("verify bond: PASS (clean LACP, bond-static, bond-passive, bond-swap)")
+
+
 VERIFY_STAGES = {
     "foundation": verify_foundation,
     "topology": verify_topology,
     "skeleton": verify_skeleton,
     "vlan": verify_vlan,
+    "bond": verify_bond,
 }
 
 
@@ -1277,8 +1731,139 @@ def clear_wrong_vlan():
                 vm_run(f"ovs-vsctl set port {port} tag={tag}", check=False)
 
 
-FAULTS = {"incomplete-config": fault_incomplete_config, "wrong-vlan": fault_wrong_vlan}
-CLEAR_FUNCS = [clear_wrong_vlan, clear_incomplete_config]
+def _bond_node(args, cmd):
+    """Resolve a single data node with a bond from a fault's args."""
+    if len(args) != 1:
+        fatal(f"usage: nt-testbed fault {cmd} <hostname>")
+    host = args[0]
+    node = next((n for n in expected_nodes() if n["hostname"] == host), None)
+    if node is None or not node_bond(node):
+        fatal(f"{host} is not a bonded data node in topology.yaml")
+    return node
+
+
+def _set_host_lacp_active(host, state, check=True):
+    """Toggle the deployed node's kernel bond LACP activity (active/passive).
+
+    lacp_active can only be changed while the bond is administratively down
+    (the kernel rejects it on an up bond), so bounce the bond around the
+    change. Idempotent: a no-op when the bond already has the wanted value, so
+    clearing other faults does not needlessly bounce the bond.
+    """
+    bond = node_bond(next(n for n in expected_nodes() if n["hostname"] == host))["name"]
+    # The bash -c argument is wrapped in single quotes below, so this script
+    # must not contain single quotes; lacp_active reads "on 1"/"off 0" from
+    # sysfs, so cut the first field with a double-quoted delimiter.
+    script = (
+        f'cur=$(cut -d" " -f1 /sys/class/net/{bond}/bonding/lacp_active 2>/dev/null); '
+        f'[ "$cur" = "{state}" ] && exit 0; '
+        f"ip link set {bond} down && ip link set {bond} type bond lacp_active {state} && "
+        f"ip link set {bond} up"
+    )
+    vm_run("lxc exec " + host + " -- bash -c '" + script + "'", check=check)
+
+
+def _pause_reconciler():
+    """Stop the reconciler from reverting a fault-modified OVS bond."""
+    vm_run(f"touch {BOND_PAUSE_FLAG}")
+
+
+def fault_bond_static(args):
+    """Disable LACP on a node's OVS bond: the switch behaves static while the
+    host still expects 802.3ad, so no PDUs arrive -> bond-mode-mismatch."""
+    node = _bond_node(args, "bond-static")
+    _pause_reconciler()
+    vm_run(f"ovs-vsctl set port {ovs_bond_name(node['hostname'])} lacp=off")
+    log(f"fault injected: {node['hostname']} OVS bond LACP disabled (static switch)")
+
+
+def fault_bond_passive(args):
+    """Emulate the both-passive case: the host bond is LACP-passive and no PDUs
+    arrive. The OVS bond's LACP is disabled (not just set passive): OVS keeps
+    transmitting on an already-established session even when passive, so only
+    lacp=off reliably silences it. The validator distinguishes this from a
+    static switch by the host's lacp_active flag, giving the both-passive hint.
+    """
+    node = _bond_node(args, "bond-passive")
+    host = node["hostname"]
+    _pause_reconciler()
+    vm_run(f"ovs-vsctl set port {ovs_bond_name(host)} lacp=off")
+    _set_host_lacp_active(host, "off")
+    log(f"fault injected: {host} host bond LACP-passive and switch silent (both-passive)")
+
+
+# A distinct LACP system id for the "wrong switch" half of a cable swap so the
+# node sees two different actor system ids across its bond members.
+WRONG_SWITCH_SYSTEM_ID = "02:00:00:00:00:7e"
+
+
+def fault_bond_swap(args):
+    """Move one bond member into a second OVS bond with a different LACP system
+    id, emulating a cable plugged into the wrong switch -> asymmetric-bond-cable.
+
+    OVS bonds require at least two interfaces, so each half is padded with an
+    internal dummy interface that does not affect LACP toward the node.
+    """
+    node = _bond_node(args, "bond-swap")
+    host = node["hostname"]
+    bridge = PXE["bridge"]
+    tag = VLANS[node_bond(node)["vlan"]]["tag"]
+    ports = _bond_member_ports(node)
+    if len(ports) < 2:
+        fatal(f"{host} bond has fewer than two members; cannot emulate a swap")
+    _pause_reconciler()
+    name = ovs_bond_name(host)
+    extras = swap_extra_names(host)
+    wrong, pad_a, pad_b = extras["wrong"], extras["pad_a"], extras["pad_b"]
+    vm_run(f"ovs-vsctl --if-exists del-port {bridge} {name}")
+    vm_run(
+        f"ovs-vsctl add-bond {bridge} {name} {ports[0]} {pad_a} "
+        f"-- set interface {pad_a} type=internal "
+        f"-- set port {name} bond_mode=balance-tcp lacp=active "
+        f"other_config:lacp-time=slow tag={tag}"
+    )
+    vm_run(
+        f"ovs-vsctl add-bond {bridge} {wrong} {ports[1]} {pad_b} "
+        f"-- set interface {pad_b} type=internal "
+        f"-- set port {wrong} bond_mode=balance-tcp lacp=active "
+        f"other_config:lacp-time=slow other_config:lacp-system-id={WRONG_SWITCH_SYSTEM_ID} "
+        f"tag={tag}"
+    )
+    log(f"fault injected: {host} bond member {ports[1]} moved to wrong-switch bond {wrong}")
+
+
+def clear_bond():
+    """Restore unified OVS bonds and host LACP activity from topology.yaml.
+
+    Rebuilds each running node's bond synchronously (the fault sequence runs
+    while the nodes are deployed); for powered-off nodes it just clears any
+    fault-only bonds and lets the reconciler rebuild on the next boot. The
+    reconciler stays paused until every node is restored, then resumes.
+    """
+    bridge = PXE["bridge"]
+    for node in expected_nodes():
+        if not node_bond(node):
+            continue
+        host = node["hostname"]
+        name = ovs_bond_name(host)
+        if vm_ok(f"lxc exec {host} -- true"):
+            build_ovs_bond(node)
+            _set_host_lacp_active(host, "on", check=False)
+        else:
+            for extra in swap_extra_names(host).values():
+                vm_run(f"ovs-vsctl --if-exists del-port {bridge} {extra}", check=False)
+            vm_run(f"ovs-vsctl --if-exists set port {name} lacp=active", check=False)
+    vm_run(f"rm -f {BOND_PAUSE_FLAG}", check=False)
+
+
+FAULTS = {
+    "incomplete-config": fault_incomplete_config,
+    "wrong-vlan": fault_wrong_vlan,
+    "bond-static": fault_bond_static,
+    "bond-passive": fault_bond_passive,
+    "bond-swap": fault_bond_swap,
+}
+CLEAR_FUNCS = [clear_wrong_vlan, clear_bond, clear_incomplete_config]
 
 
 def clear_faults():

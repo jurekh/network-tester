@@ -66,6 +66,13 @@ maas:
 # Node NICs: index 0 is the boot NIC. `vlan` names an entry in vlans above
 # (omit for the untagged PXE segment); `ip` is the STATIC address MAAS
 # assigns, required so the topology JSON carries peer IPs before deployment.
+#
+# `bond` (data nodes): two extra member NICs on br-rack1 aggregated into an
+# OVS LACP bond (lacp=active, lacp-time=slow) on the host side and a matching
+# 802.3ad bond inside MAAS. The bond carries the data VLAN tag and the STATIC
+# data IP; the LACP PDUs OVS sends let the bond-validator confirm bond mode
+# and cabling. The boot NIC stays on the mgmt VLAN so commissioning and the
+# Juju agent never depend on the bonded data fabric.
 racks:
   rack-1:
     nodes:
@@ -78,9 +85,12 @@ racks:
           - bridge: br-rack1
             vlan: mgmt
             ip: 10.100.4.11
-          - bridge: br-rack1
-            vlan: data
-            ip: 10.100.2.11
+        bond:
+          name: bond0
+          mode: 802.3ad
+          vlan: data
+          ip: 10.100.2.11
+          members: 2
       - hostname: r1-data-02
         role: data
         cpu: 2
@@ -90,9 +100,12 @@ racks:
           - bridge: br-rack1
             vlan: mgmt
             ip: 10.100.4.12
-          - bridge: br-rack1
-            vlan: data
-            ip: 10.100.2.12
+        bond:
+          name: bond0
+          mode: 802.3ad
+          vlan: data
+          ip: 10.100.2.12
+          members: 2
       - hostname: r1-oam-01
         role: bmc-oam
         cpu: 1
