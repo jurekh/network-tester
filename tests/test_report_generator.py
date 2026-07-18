@@ -278,7 +278,9 @@ def test_expected_bgp_path_without_record_is_inconclusive():
     )
     entries = [e for e in report["inconclusive_checks"] if e["type"] == "bgp-reachability"]
     assert len(entries) == 1
-    assert entries[0]["details"]["rack_pair"] == ["rack-2", "rack-1"]
+    # rack_pair is the (sorted) link; the note text carries the missing direction
+    assert entries[0]["details"]["rack_pair"] == ["rack-1", "rack-2"]
+    assert "rack-2 -> rack-1" in entries[0]["note"]
     # the reported direction still passes
     assert len([e for e in report["passed_checks"] if e["type"] == "bgp-reachability"]) == 1
 
@@ -381,3 +383,199 @@ def test_no_manifest_skips_swap_detection():
     out = _bond_doc({"eno1": [_bond_pdu(port=1)]}, IFACES)
     report = report_generator.generate_report([out])
     assert [o for o in report["observations"] if o["type"] == "symmetric-bond-swap"] == []
+
+
+# --- directional reconciliation (7.11-7.16) ----------------------------------------
+
+
+def bgp_fail_path(source_rack, source, target_rack, target, ftype="likely-bgp-failure"):
+    hops = [{"hop": 1, "ip": "10.20.1.1", "rtt_ms": 0.1}]
+    return {
+        "source_rack": source_rack,
+        "source_node": source,
+        "target_rack": target_rack,
+        "representative_target": target,
+        "fallback_target": None,
+        "reachable": False,
+        "target_role": None,
+        "observation_status": "failure",
+        "finding": {
+            "type": ftype,
+            "classification": "inferred",
+            "scope": "rack-pair",
+            "diagnosis_confidence": "inferred",
+            "hint": f"traffic from {source_rack} stops at ToR",
+            "details": {"rack_pair": [source_rack, target_rack], "traceroute_hops": hops},
+        },
+    }
+
+
+def bgp_fallback_path(source_rack, source, target_rack, rep, fallback):
+    return {
+        "source_rack": source_rack,
+        "source_node": source,
+        "target_rack": target_rack,
+        "representative_target": rep,
+        "fallback_target": fallback,
+        "reachable": True,
+        "target_role": "fallback",
+        "observation_status": "success",
+    }
+
+
+DEFINITIVE_VLAN = {
+    "type": "missing-l2-neighbor",
+    "classification": "definitive",
+    "scope": "interface",
+    "hint": "expected peer did not respond",
+    "details": {"peer_system_id": "x"},
+}
+
+
+def rep_doc(sid, hostname, bgp=None, mtu=None, phase1_fail=False):
+    doc = probe_doc(sid, hostname, bgp=bgp or [], mtu=mtu or [], representative=True)
+    if phase1_fail:
+        doc["vlan_neighbor_validator"]["findings"] = [dict(DEFINITIVE_VLAN)]
+    return doc
+
+
+def bgp_passes(report):
+    return [e for e in report["passed_checks"] if e["type"] == "bgp-reachability"]
+
+
+def test_both_directions_fail_one_inferred_failure():
+    outputs = [
+        rep_doc(
+            "aaa001", "r1-data-01", bgp=[bgp_fail_path("rack-1", "aaa001", "rack-2", "bbb002")]
+        ),
+        rep_doc(
+            "bbb002", "r2-data-02", bgp=[bgp_fail_path("rack-2", "bbb002", "rack-1", "aaa001")]
+        ),
+    ]
+    report = report_generator.generate_report(outputs, topology=TOPOLOGY, verbose=True)
+    assert len(report["inferred_failures"]) == 1
+    inf = report["inferred_failures"][0]
+    assert inf["scope"] == "rack-pair"
+    assert set(inf["observed_by"]) == {"aaa001", "bbb002"}
+    assert set(inf["details"]["per_node_traceroute"]) == {"aaa001", "bbb002"}
+    assert bgp_passes(report) == []
+    assert report_generator.exit_code(report) == 2
+
+
+def test_one_direction_fails_healthy_reverse_is_warning():
+    outputs = [
+        rep_doc(
+            "aaa001", "r1-data-01", bgp=[bgp_fail_path("rack-1", "aaa001", "rack-2", "bbb002")]
+        ),
+        rep_doc("bbb002", "r2-data-02", bgp=[bgp_path("rack-2", "bbb002", "rack-1", "aaa001")]),
+    ]
+    report = report_generator.generate_report(outputs, topology=TOPOLOGY, verbose=True)
+    assert report["inferred_failures"] == []
+    warns = [w for w in report["warnings"] if w["type"] == "bgp-directional"]
+    assert len(warns) == 1 and warns[0]["details"]["node"] == "aaa001"
+    assert len(bgp_passes(report)) == 1  # healthy reverse still passes
+
+
+def test_one_direction_fails_missing_reverse_is_inconclusive():
+    outputs = [
+        rep_doc(
+            "aaa001", "r1-data-01", bgp=[bgp_fail_path("rack-1", "aaa001", "rack-2", "bbb002")]
+        ),
+    ]
+    report = report_generator.generate_report(outputs, topology=TOPOLOGY)
+    assert report["inferred_failures"] == []
+    inc = [e for e in report["inconclusive_checks"] if e["type"] == "bgp-reachability"]
+    assert len(inc) == 1
+    assert "cannot confirm a fabric failure" in inc[0]["note"]
+
+
+def test_fallback_success_emits_single_target_warning():
+    outputs = [
+        rep_doc(
+            "aaa001",
+            "r1-data-01",
+            bgp=[bgp_fallback_path("rack-1", "aaa001", "rack-2", "bbb002", "bbb003")],
+        ),
+        rep_doc("bbb002", "r2-data-02", bgp=[bgp_path("rack-2", "bbb002", "rack-1", "aaa001")]),
+    ]
+    report = report_generator.generate_report(outputs, topology=TOPOLOGY, verbose=True)
+    warns = [w for w in report["warnings"] if w["type"] == "target-representative-unreachable"]
+    assert len(warns) == 1 and warns[0]["details"]["node"] == "bbb002"
+    assert len(bgp_passes(report)) == 2  # both directions positive
+
+
+def test_source_phase1_failure_gates_bgp_to_inconclusive():
+    outputs = [
+        rep_doc(
+            "aaa001",
+            "r1-data-01",
+            bgp=[bgp_path("rack-1", "aaa001", "rack-2", "bbb002")],
+            mtu=[mtu_record("rack-1", "aaa001", "rack-2", "bbb002")],
+            phase1_fail=True,
+        ),
+        rep_doc("bbb002", "r2-data-02", bgp=[bgp_path("rack-2", "bbb002", "rack-1", "aaa001")]),
+    ]
+    report = report_generator.generate_report(outputs, topology=TOPOLOGY)
+    inc = [e for e in report["inconclusive_checks"] if e["type"] == "bgp-reachability"]
+    assert any("definitive phase-1 failure" in e["note"] for e in inc)
+    # the gated source's MTU observation is annotated with the same reference
+    gated_obs = [o for o in report["observations"] if o.get("source_node") == "aaa001"]
+    assert gated_obs and "phase-1 failure" in gated_obs[0].get("note", "")
+
+
+def test_target_phase1_failure_attributes_failure_to_target():
+    # aaa001 -> rack-2 fails toward bbb002, which has its own phase-1 failure
+    outputs = [
+        rep_doc(
+            "aaa001", "r1-data-01", bgp=[bgp_fail_path("rack-1", "aaa001", "rack-2", "bbb002")]
+        ),
+        rep_doc(
+            "bbb002",
+            "r2-data-02",
+            bgp=[bgp_path("rack-2", "bbb002", "rack-1", "aaa001")],
+            phase1_fail=True,
+        ),
+    ]
+    report = report_generator.generate_report(outputs, topology=TOPOLOGY)
+    assert report["inferred_failures"] == []
+    warns = [w for w in report["warnings"] if w["type"] == "target-representative-unhealthy"]
+    assert len(warns) == 1 and warns[0]["details"]["node"] == "bbb002"
+
+
+def test_mtu_asymmetry_warning():
+    outputs = [
+        rep_doc(
+            "aaa001",
+            "r1-data-01",
+            bgp=[bgp_path("rack-1", "aaa001", "rack-2", "bbb002")],
+            mtu=[mtu_record("rack-1", "aaa001", "rack-2", "bbb002", mtu=9000)],
+        ),
+        rep_doc(
+            "bbb002",
+            "r2-data-02",
+            bgp=[bgp_path("rack-2", "bbb002", "rack-1", "aaa001")],
+            mtu=[mtu_record("rack-2", "bbb002", "rack-1", "aaa001", mtu=1500)],
+        ),
+    ]
+    report = report_generator.generate_report(outputs, topology=TOPOLOGY)
+    warns = [w for w in report["warnings"] if w["type"] == "mtu-asymmetry"]
+    assert len(warns) == 1
+    assert warns[0]["details"]["observed"] == {"rack-1": 9000, "rack-2": 1500}
+
+
+def test_not_started_bgp_section_is_inconclusive():
+    # aaa001 reports but its cross-rack sections never started (empty paths)
+    aaa = probe_doc("aaa001", "r1-data-01", representative=True)
+    aaa["bgp_inference"] = {"validator_status": "not_started", "paths": [], "findings": []}
+    aaa["mtu_validator"] = {
+        "validator_status": "not_started",
+        "cross_rack_mtu": [],
+        "findings": [],
+    }
+    bbb = rep_doc("bbb002", "r2-data-02", bgp=[bgp_path("rack-2", "bbb002", "rack-1", "aaa001")])
+    report = report_generator.generate_report([aaa, bbb], topology=TOPOLOGY)
+    inc = [e for e in report["inconclusive_checks"] if e["type"] == "bgp-reachability"]
+    # rack-1 -> rack-2 has no record (not_started) -> its direction is inconclusive
+    assert any("rack-1 -> rack-2" in e["note"] for e in inc)
+    mtu_inc = [e for e in report["inconclusive_checks"] if e["type"] == "cross-rack-mtu"]
+    assert any("rack-1 -> rack-2" in e["note"] for e in mtu_inc)

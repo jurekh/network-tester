@@ -6,8 +6,9 @@ files. When a topology is provided, it also diffs aggregated observations
 against the expected check universe derived from the reachability model:
 VLAN edges between in-scope same-fabric/VLAN machines (bidirectional
 confirmation, skip grouping by out-of-scope peer) and representative-sampled
-cross-rack BGP/MTU rack-pair paths. Directional BGP reconciliation and
-health gating arrive in stage 7.
+cross-rack BGP/MTU rack-pair paths. BGP results are reconciled across both
+directions of each rack-pair link, with source/target phase-1 health gating,
+and MTU records become informational observations with asymmetry warnings.
 """
 
 import json
@@ -164,88 +165,288 @@ def _path_record(by_sid, source_sid, section_name, list_key, remote_rack):
     return None
 
 
-def _classify_cross_rack(report, topology, by_sid, passed):
-    """Representative-sampled rack-pair checks from explicit path records.
+PHASE1_SECTIONS = ("bond_validator", "vlan_neighbor_validator")
 
-    Only the source-rack representative's unit is consulted per directed
-    rack pair; non-representative skips never create coverage gaps.
+
+def _rep_unhealthy(by_sid, sid):
+    """True when a representative has a definitive phase-1 (bond/vlan) failure."""
+    output = by_sid.get(sid)
+    if not output:
+        return False
+    for name in PHASE1_SECTIONS:
+        for finding in (output.get(name) or {}).get("findings", []):
+            if finding.get("classification") == "definitive":
+                return True
+    return False
+
+
+def _bgp_verdict(selections, by_sid, src_rack, dst_rack):
+    """Reduce one directed rack-pair BGP path to a verdict for reconciliation.
+
+    States: success, fallback (positive but representative target down), failure
+    (definitive inferred fabric failure), inconclusive (timeout/cancelled/no
+    classified finding), missing (source rep never reported), gated (source rep
+    has a definitive phase-1 failure so its cross-rack result is unreliable).
     """
-    try:
-        selections = representatives.select_representatives(topology)
-    except ValueError:
-        return
-    for source_rack, entry in sorted(selections.items()):
-        source_sid = entry["source"]
-        for remote in sorted(entry["targets"]):
-            rack_pair = [source_rack, remote]
-            bgp = _path_record(by_sid, source_sid, "bgp_inference", "paths", remote)
-            if bgp is None:
-                report["inconclusive_checks"].append(
-                    {
-                        "type": "bgp-reachability",
-                        "note": (
-                            f"expected rack-pair path {source_rack} -> {remote} has no "
-                            f"record from representative {source_sid}"
-                        ),
-                        "details": {"rack_pair": rack_pair, "source": source_sid},
-                    }
-                )
-            elif bgp.get("observation_status") == "success":
-                passed.append(
-                    {"type": "bgp-reachability", "rack_pair": rack_pair, "source": source_sid}
-                )
-            elif bgp.get("observation_status") == "failure":
-                finding = bgp.get("finding")
-                if finding and finding.get("classification") == "inferred":
-                    entry_doc = dict(finding)
-                    entry_doc.setdefault("node", source_sid)
-                    report["inferred_failures"].append(entry_doc)
-                else:
-                    report["inconclusive_checks"].append(
-                        {
-                            "type": "bgp-reachability",
-                            "note": f"rack-pair path {source_rack} -> {remote} failed "
-                            "without a classified finding",
-                            "details": {"rack_pair": rack_pair, "source": source_sid},
-                        }
-                    )
-            else:  # timeout, cancelled, inconclusive
-                report["inconclusive_checks"].append(
-                    {
-                        "type": "bgp-reachability",
-                        "note": (
-                            f"rack-pair path {source_rack} -> {remote} was not determined "
-                            f"({bgp.get('observation_status')})"
-                        ),
-                        "details": {"rack_pair": rack_pair, "source": source_sid},
-                    }
-                )
+    src_sid = selections[src_rack]["source"]
+    rep_target = selections[src_rack]["targets"][dst_rack]["representative"]
+    verdict = {
+        "src_rack": src_rack,
+        "dst_rack": dst_rack,
+        "src": src_sid,
+        "rep_target": rep_target,
+    }
+    if _rep_unhealthy(by_sid, src_sid):
+        verdict["state"] = "gated"
+        return verdict
+    rec = _path_record(by_sid, src_sid, "bgp_inference", "paths", dst_rack)
+    verdict["rec"] = rec
+    if rec is None:
+        verdict["state"] = "missing"
+        return verdict
+    status = rec.get("observation_status")
+    if status == "success":
+        verdict["state"] = "fallback" if rec.get("target_role") == "fallback" else "success"
+    elif status == "failure" and (rec.get("finding") or {}).get("classification") == "inferred":
+        verdict["state"] = "failure"
+        verdict["finding"] = rec["finding"]
+    else:
+        verdict["state"] = "inconclusive"
+        verdict["status"] = status
+    return verdict
 
-            mtu = _path_record(by_sid, source_sid, "mtu_validator", "cross_rack_mtu", remote)
-            if mtu is not None:
-                report["observations"].append(
-                    {
-                        "type": "cross-rack-mtu",
-                        "source_node": mtu.get("source_node"),
-                        "source_rack": mtu.get("source_rack"),
-                        "target_node": mtu.get("target_node"),
-                        "target_rack": mtu.get("target_rack"),
-                        "observed_path_mtu_bytes": mtu.get("observed_path_mtu_bytes"),
-                        "observation_status": mtu.get("observation_status"),
-                    }
+
+def _bgp_inconclusive(rack_pair, verdict, note):
+    return {
+        "type": "bgp-reachability",
+        "note": note,
+        "details": {"rack_pair": rack_pair, "source": verdict["src"]},
+    }
+
+
+def _reconcile_bgp_link(report, selections, by_sid, a, b, passed, fallback_warned):
+    directions = {}
+    for src, dst in ((a, b), (b, a)):
+        if dst in selections.get(src, {}).get("targets", {}):
+            directions[(src, dst)] = _bgp_verdict(selections, by_sid, src, dst)
+    states = {k: v["state"] for k, v in directions.items()}
+    failures = [k for k, s in states.items() if s == "failure"]
+    healthy = [k for k, s in states.items() if s in ("success", "fallback")]
+    indeterminate = [k for k, s in states.items() if s in ("inconclusive", "missing", "gated")]
+    pair = sorted([a, b])
+
+    if len(failures) == 2:
+        report["inferred_failures"].append(_link_inferred_failure(pair, directions, failures))
+    elif failures:
+        verdict = directions[failures[0]]
+        if _rep_unhealthy(by_sid, verdict["rep_target"]):
+            # 7.14: the failure points at a target rep with its own phase-1
+            # failure; attribute it to that target node, not the fabric.
+            _target_node_warning(report, verdict)
+            indeterminate = [k for k in indeterminate if k != _reverse(failures[0])]
+        elif healthy:
+            _source_directional_warning(report, verdict)
+        else:
+            report["inconclusive_checks"].append(
+                _bgp_inconclusive(
+                    pair,
+                    verdict,
+                    f"rack-pair {pair[0]} <-> {pair[1]} failed from {verdict['src']} but the "
+                    "reverse direction is unavailable; cannot confirm a fabric failure",
                 )
+            )
+            indeterminate = [k for k in indeterminate if k != _reverse(failures[0])]
+
+    for key in healthy:
+        verdict = directions[key]
+        passed.append(
+            {"type": "bgp-reachability", "rack_pair": list(key), "source": verdict["src"]}
+        )
+        if states[key] == "fallback":
+            _fallback_target_warning(report, verdict, fallback_warned)
+
+    for key in indeterminate:
+        report["inconclusive_checks"].append(_indeterminate_note(directions[key]))
+
+
+def _reverse(key):
+    return (key[1], key[0])
+
+
+def _link_inferred_failure(pair, directions, failures):
+    findings = [directions[k]["finding"] for k in failures]
+    base = dict(findings[0])
+    base["scope"] = "rack-pair"
+    base["classification"] = "inferred"
+    base["observed_by"] = [directions[k]["src"] for k in failures]
+    base["node"] = directions[failures[0]]["src"]
+    details = dict(base.get("details") or {})
+    details["rack_pair"] = pair
+    details["per_node_traceroute"] = {
+        directions[k]["src"]: (directions[k]["finding"].get("details") or {}).get(
+            "traceroute_hops"
+        )
+        for k in failures
+    }
+    base["details"] = details
+    return base
+
+
+def _link_pair(verdict):
+    return sorted([verdict["src_rack"], verdict["dst_rack"]])
+
+
+def _source_directional_warning(report, verdict):
+    """One direction failed while the reverse is healthy: source/asymmetric issue."""
+    report["warnings"].append(
+        {
+            "type": "bgp-directional",
+            "scope": "node",
+            "message": (
+                f"cross-rack path {verdict['src_rack']} -> {verdict['dst_rack']} failed from "
+                f"{verdict['src']} but the reverse direction is healthy; possible asymmetric "
+                "routing or a source-node issue, not a confirmed rack-pair failure"
+            ),
+            "details": {"node": verdict["src"], "rack_pair": _link_pair(verdict)},
+        }
+    )
+
+
+def _target_node_warning(report, verdict):
+    """The failure points at a target rep that has its own phase-1 failure."""
+    report["warnings"].append(
+        {
+            "type": "target-representative-unhealthy",
+            "scope": "node",
+            "message": (
+                f"cross-rack path {verdict['src_rack']} -> {verdict['dst_rack']} failed toward "
+                f"representative {verdict['rep_target']}, which has a definitive phase-1 failure; "
+                "treating as a target-node issue, not a fabric failure"
+            ),
+            "details": {"node": verdict["rep_target"], "rack_pair": _link_pair(verdict)},
+        }
+    )
+
+
+def _fallback_target_warning(report, verdict, fallback_warned):
+    key = (verdict["dst_rack"], verdict["rep_target"])
+    if key in fallback_warned:
+        return
+    fallback_warned.add(key)
+    report["warnings"].append(
+        {
+            "type": "target-representative-unreachable",
+            "scope": "node",
+            "message": (
+                f"representative target {verdict['rep_target']} in {verdict['dst_rack']} was "
+                "unreachable; a fallback data node answered, so the rack-pair is reachable but "
+                "the representative host needs attention"
+            ),
+            "details": {"node": verdict["rep_target"], "rack": verdict["dst_rack"]},
+        }
+    )
+
+
+def _indeterminate_note(verdict):
+    pair = sorted([verdict["src_rack"], verdict["dst_rack"]])
+    if verdict["state"] == "gated":
+        note = (
+            f"rack-pair path {verdict['src_rack']} -> {verdict['dst_rack']} is inconclusive: "
+            f"source representative {verdict['src']} has a definitive phase-1 failure"
+        )
+    elif verdict["state"] == "missing":
+        note = (
+            f"expected rack-pair path {verdict['src_rack']} -> {verdict['dst_rack']} has no "
+            f"record from representative {verdict['src']}"
+        )
+    else:
+        note = (
+            f"rack-pair path {verdict['src_rack']} -> {verdict['dst_rack']} was not determined "
+            f"({verdict.get('status', 'inconclusive')})"
+        )
+    return {
+        "type": "bgp-reachability",
+        "note": note,
+        "details": {"rack_pair": pair, "source": verdict["src"]},
+    }
+
+
+def _classify_mtu(report, selections, by_sid):
+    """Per-direction MTU observations plus a warning on asymmetric values."""
+    observed = {}  # (rack_pair tuple) -> {src_rack: mtu_bytes}
+    for src_rack, entry in sorted(selections.items()):
+        src_sid = entry["source"]
+        gated = _rep_unhealthy(by_sid, src_sid)
+        for remote in sorted(entry["targets"]):
+            rack_pair = [src_rack, remote]
+            mtu = _path_record(by_sid, src_sid, "mtu_validator", "cross_rack_mtu", remote)
+            if mtu is not None:
+                obs = {
+                    "type": "cross-rack-mtu",
+                    "source_node": mtu.get("source_node"),
+                    "source_rack": mtu.get("source_rack"),
+                    "target_node": mtu.get("target_node"),
+                    "target_rack": mtu.get("target_rack"),
+                    "observed_path_mtu_bytes": mtu.get("observed_path_mtu_bytes"),
+                    "observation_status": mtu.get("observation_status"),
+                }
+                if gated:
+                    obs["note"] = (
+                        f"source representative {src_sid} has a definitive phase-1 failure"
+                    )
+                report["observations"].append(obs)
+                if mtu.get("observation_status") == "success":
+                    observed.setdefault(tuple(sorted(rack_pair)), {})[src_rack] = mtu.get(
+                        "observed_path_mtu_bytes"
+                    )
             if mtu is None or mtu.get("observation_status") in ("timeout", "cancelled"):
                 status = mtu.get("observation_status") if mtu else "no record"
                 report["inconclusive_checks"].append(
                     {
                         "type": "cross-rack-mtu",
                         "note": (
-                            f"expected MTU path {source_rack} -> {remote} was not "
-                            f"measured ({status})"
+                            f"expected MTU path {src_rack} -> {remote} was not measured ({status})"
                         ),
-                        "details": {"rack_pair": rack_pair, "source": source_sid},
+                        "details": {"rack_pair": rack_pair, "source": src_sid},
                     }
                 )
+    for pair, values in sorted(observed.items()):
+        if len(values) == 2 and len(set(values.values())) > 1:
+            report["warnings"].append(
+                {
+                    "type": "mtu-asymmetry",
+                    "scope": "rack-pair",
+                    "message": (
+                        f"rack-pair {pair[0]} <-> {pair[1]} reports disagreeing path MTU "
+                        f"per direction: {values}"
+                    ),
+                    "details": {"rack_pair": list(pair), "observed": values},
+                }
+            )
+
+
+def _classify_cross_rack(report, topology, by_sid, passed):
+    """Representative-sampled rack-pair checks with directional reconciliation.
+
+    BGP results are reconciled across both directions of each rack-pair link
+    before assigning final confidence (both fail -> one inferred failure; one
+    fails with a healthy reverse -> directional warning; missing/gated/timeout
+    -> inconclusive). MTU records become informational observations with a
+    warning on asymmetric values. Source and target phase-1 health gate the
+    cross-rack verdicts.
+    """
+    try:
+        selections = representatives.select_representatives(topology)
+    except ValueError:
+        return
+    links = set()
+    for src_rack, entry in selections.items():
+        for remote in entry["targets"]:
+            links.add(tuple(sorted([src_rack, remote])))
+    fallback_warned = set()
+    for a, b in sorted(links):
+        _reconcile_bgp_link(report, selections, by_sid, a, b, passed, fallback_warned)
+    _classify_mtu(report, selections, by_sid)
 
 
 def _classify_mac_manifest(report, manifest, by_sid):

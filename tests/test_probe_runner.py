@@ -123,12 +123,18 @@ def test_local_macs_parses_ip_link_output(monkeypatch):
 
 
 def test_full_probe_run_writes_schema_valid_output(monkeypatch, tmp_path, capsys, fake_tools):
+    import bgp_inference
+    import mtu_validator
+
     output = tmp_path / "var" / "log" / "probe-output.json"
     monkeypatch.setattr(probe_runner, "OUTPUT_PATH", output)
     monkeypatch.setattr(probe, "local_macs", lambda: {"52:54:00:01:01:01"})
     # the vlan validator's expected peer (aaa002) answers ARP and ICMP
     fake_tools["arp"]["10.20.1.12"] = True
     fake_tools["ping3"]["10.20.1.12"] = PING_OK
+    # aaa001 is rack-1's representative: cross-rack MTU/BGP probes to rack-2 succeed
+    monkeypatch.setattr(mtu_validator, "_ping_df", lambda ip, size, c: (True, None))
+    monkeypatch.setattr(bgp_inference, "_icmp_ok", lambda ip, c: True)
 
     assert probe.main([str(TOPOLOGY), "30"]) == 0
 
@@ -142,9 +148,11 @@ def test_full_probe_run_writes_schema_valid_output(monkeypatch, tmp_path, capsys
     for section in schemas.VALIDATOR_SECTIONS:
         assert doc[section]["validator_status"] == "complete"
         assert doc[section]["findings"] == []
-    # structured cross-rack path record lists exist even when empty
-    assert doc["mtu_validator"]["cross_rack_mtu"] == []
-    assert doc["bgp_inference"]["paths"] == []
+    # the representative records one cross-rack MTU observation and one reachable path
+    mtu_recs = doc["mtu_validator"]["cross_rack_mtu"]
+    assert [r["observed_path_mtu_bytes"] for r in mtu_recs] == [9000]
+    paths = doc["bgp_inference"]["paths"]
+    assert len(paths) == 1 and paths[0]["reachable"] is True
     assert "status complete" in capsys.readouterr().out
 
 

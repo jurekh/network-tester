@@ -1,0 +1,78 @@
+{
+  "schema_version": "1",
+  "status": "complete",
+  "node": {
+    "system_id": "aaa001",
+    "hostname": "r1-data-01",
+    "interfaces": [
+      {
+        "name": "bond0",
+        "type": "bond",
+        "mac": "52:54:00:01:01:01",
+        "bond_mode": "802.3ad",
+        "bond_members": [
+          {"name": "eno1", "mac": "52:54:00:01:01:01"},
+          {"name": "eno2", "mac": "52:54:00:01:01:02"}
+        ],
+        "fabric": "fabric-data",
+        "fabric_class": "data",
+        "vlan_tag": 100,
+        "subnet_cidr": "10.20.1.0/24",
+        "ip": "10.20.1.11",
+        "gateway_ip": "10.20.1.1"
+      }
+    ]
+  },
+  "bond_validator": {"validator_status": "complete", "findings": [], "bonds": []},
+  "vlan_neighbor_validator": {"validator_status": "complete", "findings": [], "observations": []},
+  "mtu_validator": {
+    "validator_status": "complete",
+    "findings": [],
+    "cross_rack_mtu": [
+      {
+        "source_rack": "rack-1",
+        "source_node": "aaa001",
+        "target_rack": "rack-2",
+        "target_node": "bbb001",
+        "observed_path_mtu_bytes": null,
+        "observation_status": "inconclusive",
+        "note": "ICMP may be filtered on this path; manual MTU verification required"
+      }
+    ]
+  },
+  "bgp_inference": {
+    "validator_status": "complete",
+    "findings": [],
+    "paths": [
+      {
+        "source_rack": "rack-1",
+        "source_node": "aaa001",
+        "target_rack": "rack-2",
+        "representative_target": "bbb001",
+        "fallback_target": "bbb002",
+        "reachable": false,
+        "target_role": null,
+        "observation_status": "failure",
+        "traceroute_hops": [
+          {"hop": 1, "ip": "10.20.1.1", "rtt_ms": 0.12},
+          {"hop": 2, "ip": null, "rtt_ms": null}
+        ],
+        "finding": {
+          "type": "likely-bgp-failure",
+          "classification": "inferred",
+          "scope": "rack-pair",
+          "diagnosis_confidence": "inferred",
+          "hint": "Traffic from rack-1 stops at ToR (IP 10.20.1.1); BGP session may be down.",
+          "details": {
+            "rack_pair": ["rack-1", "rack-2"],
+            "traceroute_hops": [
+              {"hop": 1, "ip": "10.20.1.1", "rtt_ms": 0.12},
+              {"hop": 2, "ip": null, "rtt_ms": null}
+            ],
+            "traceroute_truncated": false
+          }
+        }
+      }
+    ]
+  }
+}
