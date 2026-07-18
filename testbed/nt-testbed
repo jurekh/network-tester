@@ -469,28 +469,25 @@ def ensure_images():
         interval=30,
     )
 
-    def rack_reports_images():
+    def rack_boot_proxy_ready():
         # Rack controllers do not sync boot images; they proxy and cache them
-        # from the region on demand (only region controllers replicate images,
-        # and only in HA/multi-region setups). This only confirms the rack
-        # controller endpoint is up and can see the region's boot resources.
-        # The list-boot-images API is deprecated and returns a hardcoded
-        # status: synced, so this is a liveness check, not a sync wait.
-        racks = maas_json("rack-controllers read")
-        images = maas_json(
-            f"rack-controller list-boot-images {racks[0]['system_id']}", check=False
-        )
-        return images is not None and images.get("status") == "synced"
+        # from the region on demand via the maas-agent HTTP boot proxy on port
+        # 5248 (only region controllers replicate images, in HA/multi-region
+        # setups). The meaningful readiness signal is that proxy actually
+        # serving a bootloader: a 200 for bootx64.efi (the URL nodes fetch over
+        # PXE) means the agent is healthy and can fetch/cache from the region,
+        # which is what lets nodes boot. An unhealthy agent returns 502 here
+        # even after the region import is complete (the list-boot-images API is
+        # deprecated and hardcodes status: synced, so it cannot detect this).
+        return vm_ok("curl -fsS -o /dev/null http://localhost:5248/images/bootx64.efi")
 
     wait_for(
-        "rack controller to report region boot images",
-        rack_reports_images,
+        "rack controller boot proxy to serve bootloaders",
+        rack_boot_proxy_ready,
         timeout=900,
         interval=20,
     )
-    log(
-        "region boot images imported; rack controllers proxy and cache them from the region on demand"
-    )
+    log("rack controller boot proxy serving bootloaders (proxied/cached from the region)")
 
 
 def ensure_inner_lxd():
