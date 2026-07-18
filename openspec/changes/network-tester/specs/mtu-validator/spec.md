@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
-### Requirement: Probe path MTU to cross-rack peers using oversized ICMP with DF-bit
-The mtu-validator SHALL probe the effective path MTU only from local machines with `role: data` to cross-rack in-scope data peers. If the local node is not `role: data`, the validator SHALL skip MTU probing with an explicit empty result and skip reason. Cross-rack peers are derived from the machines list by selecting machines with `in_scope: true`, `role: data`, and `rack` different from the local node's rack. Source and target IP addresses SHALL be selected from data-fabric interfaces only; management/OAM IPs SHALL NOT be used for MTU probing. Cross-rack peers are the relevant target because MTU observations matter on routed paths; L2 neighbor pairs share link MTU and do not require MTU probing. Probing SHALL use `ping -M do -s <size> -c 1 -W 2 <target>` (iputils-ping) at multiple ICMP payload sizes: 1472 bytes (standard Ethernet: 1472 + 28-byte IP/ICMP header = 1500-byte frame) and 8972 bytes (jumbo: 8972 + 28 = 9000-byte frame), plus a binary-search refinement step if initial probes show a boundary. The validator SHALL record the final observed path MTU for each probed peer pair without pass/fail comparison; verdicting is deferred to v2. At most 7 probes are sent per peer (two initial sizes plus up to 5 binary-search iterations), bounding per-peer probe time to about 14 seconds at the 2-second per-probe timeout; the validator SHALL check the shared cancellation event between peers and stop promptly when it is set.
+### Requirement: Probe path MTU between rack representatives using oversized ICMP with DF-bit
+The mtu-validator SHALL probe the effective path MTU only from the deterministic representative data node for the local rack to one deterministic representative data node in each remote in-scope rack. A rack representative is the in-scope data-role machine in that rack with the lexicographically lowest `system_id`; sorting by `system_id` ensures deterministic selection across runs regardless of MAAS API response ordering. If the local node is not `role: data` or is not the selected representative for its rack, the validator SHALL skip MTU probing with an explicit empty result and skip reason. Cross-rack peers are derived by selecting the representative in each rack with `in_scope: true`, `role: data`, and `rack` different from the local node's rack. Source and target IP addresses SHALL be selected from data-fabric interfaces only; management/OAM IPs SHALL NOT be used for MTU probing. Cross-rack representative peers are the relevant target because MTU observations matter on routed rack-to-rack paths; L2 neighbor pairs share link MTU and do not require MTU probing. Probing SHALL use `ping -M do -s <size> -c 1 -W 2 <target>` (iputils-ping) at multiple ICMP payload sizes: 1472 bytes (standard Ethernet: 1472 + 28-byte IP/ICMP header = 1500-byte frame) and 8972 bytes (jumbo: 8972 + 28 = 9000-byte frame), plus a binary-search refinement step if initial probes show a boundary. The validator SHALL record the final observed path MTU for each probed rack-pair representative path without pass/fail comparison; verdicting is deferred to v2. At most 7 probes are sent per remote rack (two initial sizes plus up to 5 binary-search iterations), bounding MTU wall-clock to about 14 seconds times the number of remote in-scope racks; the validator SHALL check the shared cancellation event between remote racks and stop promptly when it is set.
 
 #### Scenario: Path supports jumbo frames end-to-end
 - **WHEN** an 8972-byte `ping -M do` probe reaches the peer and returns a reply
@@ -19,12 +19,16 @@ The mtu-validator SHALL probe the effective path MTU only from local machines wi
 - **WHEN** an intermediate device returns ICMP type 3 code 4 (fragmentation needed) in response to a DF-bit probe
 - **THEN** the validator SHALL record the MTU indicated in the ICMP message as the effective path MTU
 
-### Requirement: Skip MTU probing when no cross-rack peers exist
-If the cross-rack peer set is empty (because the local node is not `role: data`, or no in-scope data nodes from other racks are in the topology's machines list), the mtu-validator SHALL record `{"cross_rack_mtu": [], "skip_reason": "no cross-rack data peers"}` and exit without failure.
+### Requirement: Skip MTU probing when the local node is not a rack representative or no cross-rack representative peers exist
+If the local node is not `role: data` or is not the deterministic representative for its rack, the mtu-validator SHALL record `{"cross_rack_mtu": [], "skip_reason": "not-rack-representative"}`; the non-data case uses the same skip reason as bgp-inference. If the local node is its rack's representative but the cross-rack representative peer set is empty, the validator SHALL record `{"cross_rack_mtu": [], "skip_reason": "no cross-rack data peers"}`. In both cases the validator SHALL exit without failure.
+
+#### Scenario: Non-representative data node
+- **WHEN** the local node is a data node but is not the lexicographically lowest in-scope data `system_id` in its rack
+- **THEN** the validator SHALL write `{"cross_rack_mtu": [], "skip_reason": "not-rack-representative"}` and exit with status 0
 
 #### Scenario: Node with no cross-rack data peers
 - **WHEN** the topology machines list contains no in-scope data nodes with a different `rack` value than the local node
-- **THEN** the validator SHALL write `{"cross_rack_mtu": []}` and exit with status 0
+- **THEN** the validator SHALL write `{"cross_rack_mtu": [], "skip_reason": "no cross-rack data peers"}` and exit with status 0
 
 ### Requirement: Record inconclusive MTU results distinctly
 If ICMP probes are dropped by intermediate devices in a way that prevents determining actual path MTU, the validator SHALL record the result as `inconclusive` rather than a specific MTU value.

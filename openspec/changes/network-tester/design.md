@@ -17,8 +17,8 @@ Constraints: no switch management access; all observations are server-side; Juju
 - Detect asymmetric bond cable swaps (LACP PDU disagreement)
 - Detect bond mode mismatch between host config and switch behavior (LACP PDU capture)
 - Detect servers placed on wrong VLAN (unexpected ARP neighbors, failed ICMP to expected peers)
-- Measure observed cross-rack path MTU and record inconclusive MTU paths without pass/fail verdicts in v1
-- Infer BGP failures from cross-rack reachability and traceroute analysis
+- Measure observed cross-rack path MTU between deterministic rack representative data nodes and record inconclusive MTU paths without pass/fail verdicts in v1
+- Infer BGP failures from cross-rack reachability and traceroute analysis between deterministic rack representative data nodes
 - Optionally detect symmetric bond cable swaps when a MAC-to-port manifest is provided
 - Produce per-check pass/fail with remediation hints and informational observations in a structured report
 - Support rack-by-rack progressive deployment with all nodes held until cross-rack tests complete
@@ -57,7 +57,7 @@ Alternatives considered:
 
 ### D3: Rack-by-rack deployment, all nodes held until cross-rack tests complete
 
-Deploying all racks simultaneously would overload the MAAS rack controller in large installations. Deploying rack-by-rack and keeping nodes up avoids this while ensuring all nodes are present for cross-rack probing (BGP inference, east-west MTU). The Juju model accumulates units as racks are deployed; the leader defers probing until all expected units have joined.
+Deploying all racks simultaneously would overload the MAAS rack controller in large installations. Deploying rack-by-rack and keeping nodes up avoids this while ensuring all nodes are present while deterministic rack representatives perform cross-rack probing (BGP inference, east-west MTU). The Juju model accumulates units as racks are deployed; the leader defers probing until all expected units have joined.
 
 Alternatives considered:
 - Two-phase approach (intra-rack then cross-rack with one node per rack): adds sequencing complexity without meaningful benefit given Juju coordination is available
@@ -76,13 +76,16 @@ Alternatives considered:
 
 ### D5: BGP failure as inferred from traceroute, not FRR daemon
 
-BGP terminates on ToR switches, not servers. Running FRR on ephemeral nodes to establish a BGP test session requires the switch to be pre-configured to accept test peers - an unreliable external dependency. Traceroute analysis (traffic stops at ToR hop when cross-rack ICMP fails) provides a strong, actionable pointer to BGP without any switch pre-configuration. BGP inference is reported at rack-pair granularity: the probe tries a deterministic representative data node per remote rack and one fallback data node before inferring a rack-pair failure.
+BGP terminates on ToR switches, not servers. Running FRR on ephemeral nodes to establish a BGP test session requires the switch to be pre-configured to accept test peers - an unreliable external dependency. Traceroute analysis (traffic stops at ToR hop when cross-rack ICMP fails) provides a strong, actionable pointer to BGP without any switch pre-configuration. BGP inference is reported at rack-pair granularity: only the deterministic data-node representative for each source rack sends BGP probes; it tries a deterministic representative data node per remote rack and one fallback data node before inferring a rack-pair failure. Non-representative data nodes skip BGP inference with an explicit skip reason.
+
+A broken source representative cannot reliably self-detect before probing, so source-side failures are handled at report time rather than with a probe-time source fallback. The report-generator reconciles the two directions of each rack-pair link (rack A's representative probing rack B, and rack B's probing rack A): a rack-pair failure is inferred only when both directions fail; a one-directional failure with a healthy reverse path is downgraded to a node-scoped warning about the source representative (ICMP is round-trip, so a working reverse path clears the inter-rack path); and cross-rack findings from a representative with definitive phase-1 failures are downgraded to inconclusive. The cost of this approach is that a rack with a broken representative loses its outbound MTU observations for the run.
 
 FRR-on-host is deferred until hosts run BGP natively for the data fabric, at which point the charm can check the BGP daemon's session state directly.
 
 Alternatives considered:
 - FRR BGP daemon on ephemeral node: requires switch pre-configuration per test run; deferred
 - Assume BGP works if cross-rack ICMP works: insufficient - masks partial failures
+- Probe-time source fallback (standby second source node per rack): doubles second-phase probe cost to cover a case report-side reconciliation already diagnoses; dynamic handoff would also require Juju relation-data coordination; revisit in v2 if inconclusive rates prove high
 
 ### D6: CLI wrapper fans out collect-results to all units; no leader aggregation in charm
 
@@ -139,7 +142,7 @@ bond-validator (passive LACP capture) and vlan-neighbor-validator (ARP/ICMP) do 
 
 The charm passes the `probe-timeout` config value (default 240s) to the payload at invocation. The probe-runner enforces this timeout: if it elapses before all validators complete, it terminates running validators, writes partial results with `status: timeout`, and exits. This ensures the charm unit returns to `active/idle` and `collect-results` can still retrieve partial output.
 
-The default is sized against per-command caps: phase 1 is bounded by the 35s LACP capture window and the 30s ARP passive-capture cap (concurrent), MTU probing costs at most ~14s per cross-rack peer (7 probes at 2s each), and BGP inference costs two 2s ICMP probes plus one 75s-capped traceroute per remote rack. The default must stay below the Juju hook timeout (300s default) with margin for the 5s flush window, because the hook invoking the payload would otherwise be hard-killed without partial-result flushing; raising `probe-timeout` past that requires raising the hook timeout too.
+The default is sized against per-command caps: phase 1 is bounded by the 35s LACP capture window and the 30s ARP passive-capture cap (concurrent). For non-representative data nodes the second phase is skipped. For each source-rack representative, MTU probing costs at most ~14s per remote rack representative (7 probes at 2s each), and BGP inference costs two 2s ICMP probes plus one 75s-capped traceroute per remote rack. This bounds second-phase work by rack count rather than node count, but large rack counts or many failed cross-rack paths can still exceed the default timeout. The timeout-budget test must calculate the expected wall-clock for the selected rack count; if it cannot fit under the default, implementation must either raise `probe-timeout` together with the Juju hook timeout, cap the number of remote rack probes per run, or report the remaining rack-pairs as inconclusive rather than silently overrunning. The default must stay below the Juju hook timeout (300s default) with margin for the 5s flush window, because the hook invoking the payload would otherwise be hard-killed without partial-result flushing; raising `probe-timeout` past that requires raising the hook timeout too.
 
 Alternatives considered:
 - Juju hook timeout: hooks time out at 300s by default; this is a hard kill with no partial result flushing
@@ -162,6 +165,8 @@ Validator timeout handling uses cooperative cancellation: a shared cancellation 
 - [LACP PDU capture requires CAP_NET_RAW or root] -> Mitigation: charm runs as root in MAAS ephemeral environment; document this requirement
 - [MTU probe with DF-bit may be ICMP-rate-limited by intermediate devices] -> Mitigation: use multiple probe sizes (1472, 8972 payload bytes; binary search); flag inconclusive results rather than false-passing
 - [BGP inference is not definitive] -> Mitigation: label classified BGP/routing findings as inferred, label no-hop traceroute results as inconclusive, and include traceroute hop data so the operator can verify manually
+- [Large rack counts or many failed cross-rack paths can exceed the default per-unit probe timeout even with representative-node probing] -> Mitigation: timeout-budget tests calculate the wall-clock before implementation; the runner writes partial results with inconclusive unprobed rack-pairs rather than silently overrunning
+- [A broken source representative makes all outbound cross-rack probes from its rack fail or go inconclusive] -> Mitigation: report-generator reconciles both directions of each rack-pair link (failure inferred only when both directions fail; one-directional failure with a healthy reverse path becomes a source-node warning) and downgrades cross-rack findings from representatives with definitive phase-1 failures to inconclusive; outbound MTU observations from that rack are lost for the run
 - [Terraform partially applied leaves MAAS config incomplete] -> Mitigation: pre-flight validation catches this before deployment begins
 - [probe-timeout may expire before all validators complete] -> Mitigation: write partial results with `status: timeout`; report-generator treats missing checks as inconclusive
 

@@ -93,7 +93,7 @@ The CLI SHALL exit with a code that reflects the overall result: 0 if zero defin
 - **THEN** the process SHALL exit 2
 
 ### Requirement: Label BGP findings separately from definitive failures
-The report-generator SHALL separate bgp-inference findings from definitive failures. BGP findings with `diagnosis_confidence: inferred` SHALL appear under `inferred_failures` in JSON and under "Inferred failures (manual verification recommended)" in text output. BGP findings with `diagnosis_confidence: inconclusive` SHALL appear under `inconclusive_checks`, not under `inferred_failures`. Because per-unit BGP findings are rack-pair scoped, findings from multiple units that share the same (source rack, target rack) pair SHALL be aggregated into a single entry per rack pair, carrying an `observed_by` list of the reporting nodes and preserving each node's traceroute hop data.
+The report-generator SHALL separate bgp-inference findings from definitive failures. BGP findings with `diagnosis_confidence: inferred` SHALL appear under `inferred_failures` in JSON and under "Inferred failures (manual verification recommended)" in text output. BGP findings with `diagnosis_confidence: inconclusive` SHALL appear under `inconclusive_checks`, not under `inferred_failures`. Because only the source-rack representative probes each directed (source rack, target rack) pair, each directed pair has at most one reporting unit. The two directed findings covering the same rack-pair link (A-to-B and B-to-A) SHALL be merged into a single entry per rack-pair link after directional reconciliation, carrying an `observed_by` list of the reporting representatives and preserving each representative's traceroute hop data.
 
 #### Scenario: BGP inference finding included in report
 - **WHEN** the bgp-inference module produced a finding with `diagnosis_confidence: inferred`
@@ -103,9 +103,31 @@ The report-generator SHALL separate bgp-inference findings from definitive failu
 - **WHEN** the bgp-inference module produced a finding with `diagnosis_confidence: inconclusive`
 - **THEN** it SHALL appear under `inconclusive_checks`, never under `definitive_failures` or `inferred_failures`
 
-#### Scenario: Same rack-pair failure observed by multiple units
-- **WHEN** three data nodes in rack A each produce a `likely-bgp-failure` finding for the rack-A-to-rack-B pair
-- **THEN** the report SHALL contain one `inferred_failures` entry for the rack-A-to-rack-B pair with all three nodes listed in `observed_by`, not three separate entries
+#### Scenario: Same rack-pair link reported from both directions
+- **WHEN** rack A's representative produces a `likely-bgp-failure` finding for the A-to-B direction AND rack B's representative produces a `likely-bgp-failure` finding for the B-to-A direction
+- **THEN** the report SHALL contain one `inferred_failures` entry for the A-B rack-pair link with both representatives listed in `observed_by`, not two separate entries
+
+### Requirement: Reconcile directional rack-pair findings before assigning final confidence
+Each rack-pair link (A, B) has up to two probe perspectives: rack A's representative probing rack B, and rack B's representative probing rack A. The report-generator SHALL reconcile the two directions before assigning final confidence. When both directions report failure, the rack-pair entry SHALL be reported under `inferred_failures` (subject to the phase-1 health gating requirement). When one direction reports failure but the reverse direction succeeded (directly or via the fallback target), the report-generator SHALL NOT report a rack-pair failure; because ICMP is round-trip, a working reverse path means the inter-rack path forwards traffic in both directions, so the asymmetry points at the failing source representative. The generator SHALL instead emit a node-scoped warning naming the failing source representative as the suspect, preserving its traceroute hop data. When one direction's results are missing (the source representative appears in `missing_nodes`, or its unit reported `status: timeout` before bgp-inference completed), a failing single perspective SHALL be recorded under `inconclusive_checks` with a note that the reverse direction is unavailable, not under `inferred_failures`.
+
+#### Scenario: Both directions fail
+- **WHEN** rack A's representative reports the A-to-B direction unreachable AND rack B's representative reports the B-to-A direction unreachable
+- **THEN** the report SHALL contain one `inferred_failures` entry for the A-B rack-pair link
+
+#### Scenario: One direction fails, reverse direction succeeds
+- **WHEN** rack A's representative reports the A-to-B direction unreachable but rack B's representative reached rack A directly or via the fallback target
+- **THEN** the report SHALL NOT contain a rack-pair failure for A-B; it SHALL contain a `warnings` entry naming rack A's representative as the suspect node, with that node's traceroute hop data attached
+
+#### Scenario: One direction missing, the other fails
+- **WHEN** rack A's representative reports the A-to-B direction unreachable and rack B's representative produced no bgp-inference results because its unit is missing or timed out
+- **THEN** the A-B rack-pair SHALL be recorded under `inconclusive_checks` with a note that the reverse direction is unavailable, not under `inferred_failures`
+
+### Requirement: Downgrade cross-rack findings from a source representative with definitive phase-1 failures
+If a rack's source representative has one or more definitive phase-1 failures (bond-validator or vlan-neighbor-validator findings classified in `definitive_failures`), the report-generator SHALL move that representative's bgp-inference findings to `inconclusive_checks`, annotated with a reference to the node's phase-1 failure, and SHALL annotate that rack's outbound MTU observations with the same reference. A broken NIC, bond, or VLAN assignment on the source representative SHALL NOT present as a fabric-wide BGP or routing failure.
+
+#### Scenario: Source representative has a definitive bond failure
+- **WHEN** rack A's representative has a `bond-mode-mismatch` finding in `definitive_failures` and also produced `likely-bgp-failure` findings for remote racks
+- **THEN** those BGP findings SHALL appear under `inconclusive_checks` with a reference to the bond failure on the source representative, not under `inferred_failures`
 
 ### Requirement: Accept MAC-to-port manifest via CLI flag for optional symmetric swap detection
 If `--mac-manifest <path>` is passed to the CLI, the report-generator SHALL load the manifest JSON from that path and compare observed MAC addresses per interface (from collected probe outputs) against the manifest, flagging symmetric bond cable swaps where the switch port has swapped cables relative to the manifest. The manifest is not distributed to nodes; it is read locally by the CLI.
@@ -115,12 +137,16 @@ If `--mac-manifest <path>` is passed to the CLI, the report-generator SHALL load
 - **THEN** the generator SHALL record a `symmetric-bond-swap` finding (informational, not a failure) with the expected and observed MACs
 
 ### Requirement: Include MTU observations as informational results, not check verdicts
-MTU probe results from the mtu-validator SHALL be included in the `observations` list in the JSON report. Each entry SHALL include the source node, target node, and `observed_path_mtu_bytes` (or `null` with `status: "inconclusive"`). MTU observations SHALL NOT appear in `definitive_failures`, `inferred_failures`, or `passed_checks`; no pass/fail verdict is assigned in v1.
+MTU probe results from the mtu-validator SHALL be included in the `observations` list in the JSON report. Each entry SHALL include the source node, target node, and `observed_path_mtu_bytes` (or `null` with `status: "inconclusive"`). MTU observations SHALL NOT appear in `definitive_failures`, `inferred_failures`, or `passed_checks`; no pass/fail verdict is assigned in v1. When both directions of the same rack-pair link report an observed MTU and the values disagree, the generator SHALL add a `warnings` entry noting the asymmetric observation.
 
 #### Scenario: MTU observations present
 - **WHEN** one or more units returned mtu-validator results
-- **THEN** the JSON report SHALL include an `observations` list with one entry per probed peer pair
+- **THEN** the JSON report SHALL include an `observations` list with one entry per probed rack-pair representative path
 
 #### Scenario: Text summary with MTU observations
 - **WHEN** the text summary is printed
 - **THEN** MTU observations SHALL appear under an "OBSERVATIONS" section after the failures and warnings sections, listing source, target, and observed path MTU
+
+#### Scenario: Directional MTU observations disagree
+- **WHEN** rack A's representative observed path MTU 9000 toward rack B and rack B's representative observed path MTU 1500 toward rack A
+- **THEN** the report SHALL include both observations and a `warnings` entry noting the asymmetric MTU observation for the A-B rack-pair link

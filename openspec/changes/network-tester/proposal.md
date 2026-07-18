@@ -23,8 +23,8 @@ When standing up a MAAS-managed datacenter, the physical cabling and switch/host
 - `probe-runner`: Payload entry point that loads the topology JSON, resolves node identity via MAC matching, runs validators in the correct sequence (bond-validator and vlan-neighbor-validator concurrently, then mtu-validator and bgp-inference sequentially), enforces probe-timeout, and writes probe-output.json
 - `bond-validator`: Captures LACP PDUs on each interface to detect bond mode mismatches between host and switch, and identifies asymmetric bond cable swaps
 - `vlan-neighbor-validator`: Uses ARP and ICMP to verify each node sees the expected L2 neighbors on the expected interfaces, and only those neighbors (detects wrong-VLAN placement)
-- `mtu-validator`: Probes path MTU to expected cross-rack peers using oversized ICMP with DF-bit set; reports observed per-path MTU as informational observations without pass/fail verdicts in v1
-- `bgp-inference`: Tests cross-rack reachability and runs traceroute to detect where traffic stops; infers BGP session failures when traffic is blackholed at the ToR hop
+- `mtu-validator`: Probes path MTU only from one deterministic representative data node per rack to one representative data node per remote rack using oversized ICMP with DF-bit set; reports observed per-rack-pair MTU as informational observations without pass/fail verdicts in v1
+- `bgp-inference`: Tests cross-rack reachability only from one deterministic representative data node per rack to representative/fallback data nodes in each remote rack, and runs traceroute to detect where traffic stops; infers BGP session failures when traffic is blackholed at the ToR hop
 - `juju-coordinator`: Juju leader/follower coordination logic ensuring all units are ready before probing starts; exposes Juju actions to trigger probing and collect results
 - `report-generator`: Aggregates per-node probe results into a structured report listing passed checks and specific remediation hints for each failure
 
