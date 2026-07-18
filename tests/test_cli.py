@@ -58,10 +58,16 @@ def test_run_accepts_all_documented_flags(monkeypatch, tmp_path):
             "--wait-timeout",
             "120",
             "--verbose",
+            "--charm",
+            "network-tester.charm",
+            "--cloud",
+            "maas-testbed",
         ]
     )
     assert args.wait_timeout == 120
     assert args.verbose is True
+    assert args.charm == "network-tester.charm"
+    assert args.cloud == "maas-testbed"
 
 
 # --- dry-run behavior (3.9) ----------------------------------------------------
@@ -124,7 +130,7 @@ def test_run_preflight_failure_exits_nonzero_naming_machine(capsys, monkeypatch)
     assert "data-01 (aaa001): subnet" in captured.err
 
 
-def test_run_without_dry_run_stops_before_deployment(capsys, monkeypatch):
+def test_run_without_charm_stops_before_deployment(capsys, monkeypatch):
     code = run_cli(
         ["run", "--all", *MAAS_ARGS],
         monkeypatch,
@@ -132,7 +138,7 @@ def test_run_without_dry_run_stops_before_deployment(capsys, monkeypatch):
     )
     captured = capsys.readouterr()
     assert code == 2
-    assert "deployment is not implemented yet" in captured.err
+    assert "--charm <path> is required to deploy" in captured.err
 
 
 def test_unknown_rack_error_propagates(capsys, monkeypatch):
@@ -144,6 +150,82 @@ def test_unknown_rack_error_propagates(capsys, monkeypatch):
     captured = capsys.readouterr()
     assert code == 1
     assert "Unknown rack: nope. Available racks: rack1-ctl" in captured.err
+
+
+# --- deployment wiring (4.22, 4.26, 4.27) ----------------------------------------
+
+
+class RecordingFacade:
+    """Facade standing in for LibjujuFacade in CLI-level tests."""
+
+    instances = []
+
+    def __init__(self):
+        self.destroyed = []
+        self.connected = False
+        self.list_models_calls = 0
+        RecordingFacade.instances.append(self)
+
+    async def connect(self):
+        self.connected = True
+
+    async def disconnect(self):
+        self.connected = False
+
+    async def destroy_model(self, name):
+        self.destroyed.append(name)
+
+    async def list_models(self):
+        # destruction has completed by the time the CLI confirms it
+        self.list_models_calls += 1
+        return []
+
+
+def deploy_cli(argv, monkeypatch, tmp_path, keep=False):
+    """Run the CLI with fake MAAS and a stubbed juju_run.run_new."""
+    RecordingFacade.instances = []
+    monkeypatch.setattr(cli_main.juju_run, "LibjujuFacade", RecordingFacade)
+
+    async def fake_run_new(facade, topology, charm_path, wait_timeout, cloud=None, poll=10):
+        fake_run_new.calls.append((charm_path, wait_timeout, cloud))
+        return "network-test-fake", {}, []
+
+    fake_run_new.calls = []
+    monkeypatch.setattr(cli_main.juju_run, "run_new", fake_run_new)
+    monkeypatch.chdir(tmp_path)
+    code = run_cli(argv, monkeypatch, machines=[data_machine("aaa001", "data-01")])
+    return code, fake_run_new.calls
+
+
+def test_run_deploys_reports_and_destroys_model(capsys, monkeypatch, tmp_path):
+    code, calls = deploy_cli(
+        ["run", "--all", "--charm", "nt.charm", "--cloud", "maas-x", *MAAS_ARGS],
+        monkeypatch,
+        tmp_path,
+    )
+    assert code == 0
+    assert calls == [("nt.charm", 600, "maas-x")]
+    facade = RecordingFacade.instances[0]
+    assert facade.destroyed == ["network-test-fake"]
+    assert facade.list_models_calls > 0  # waited for destruction to complete
+    assert facade.connected is False
+    assert list(tmp_path.glob("network-test-*.json"))
+    assert list(tmp_path.glob("network-test-*.txt"))
+    assert "All 0 checks passed." in capsys.readouterr().out
+
+
+def test_run_keep_model_skips_destroy(capsys, monkeypatch, tmp_path):
+    code, _calls = deploy_cli(
+        ["run", "--all", "--keep-model", "--charm", "nt.charm", *MAAS_ARGS],
+        monkeypatch,
+        tmp_path,
+    )
+    assert code == 0
+    facade = RecordingFacade.instances[0]
+    assert facade.destroyed == []
+    out = capsys.readouterr().out
+    assert "Model network-test-fake kept" in out
+    assert "juju destroy-model network-test-fake" in out
 
 
 # --- subcommand surface (3.7) ----------------------------------------------------

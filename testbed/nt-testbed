@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -55,8 +56,8 @@ def fatal(msg):
     sys.exit(1)
 
 
-def host_run(args, check=True, capture=False):
-    result = subprocess.run(args, check=False, text=True, capture_output=capture)
+def host_run(args, check=True, capture=False, cwd=None):
+    result = subprocess.run(args, check=False, text=True, capture_output=capture, cwd=cwd)
     if check and result.returncode != 0:
         fatal(
             f"command failed ({result.returncode}): {shlex.join(args)}\n"
@@ -352,9 +353,99 @@ def ensure_machines():
     log("all composed machines are Ready")
 
 
+JUJU_CONTROLLER = "nt"
+MAAS_CLOUD = "maas-testbed"
+
+
+def ensure_juju():
+    """Bootstrap a Juju controller on the inner LXD and register the MAAS cloud.
+
+    The controller container attaches to the management/PXE bridge through the
+    inner LXD default profile, so MAAS-deployed nodes reach the controller API
+    without traversing the data fabric, and the controller stays outside the
+    topology under test (design D18). charmcraft is installed so the charm can
+    be packed inside the VM when the host lacks charmcraft.
+    """
+    for snap, args in (("juju", ""), ("charmcraft", "--classic")):
+        if not vm_ok(f"snap list {snap} >/dev/null 2>&1"):
+            log(f"installing snap {snap}")
+            vm_run(f"snap install {snap} {args}")
+    # the strictly confined juju snap cannot create this directory itself
+    vm_run("mkdir -p /root/.local/share/juju")
+
+    controllers = vm_run("juju controllers --format json", check=False, capture=True)
+    have_controller = False
+    if controllers.returncode == 0 and controllers.stdout.strip():
+        parsed = json.loads(controllers.stdout)
+        have_controller = JUJU_CONTROLLER in (parsed.get("controllers") or {})
+    if not have_controller:
+        log(f"bootstrapping Juju controller {JUJU_CONTROLLER} on the inner LXD")
+        vm_run(f"juju bootstrap localhost {JUJU_CONTROLLER}")
+
+    def controller_json(cmd, key):
+        result = vm_run(
+            f"juju {cmd} --controller {JUJU_CONTROLLER} --format json", check=False, capture=True
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return {}
+        parsed = json.loads(result.stdout)
+        # `juju clouds` returns cloud names at the top level; `juju
+        # credentials` nests them under a wrapper key
+        return parsed.get(key, parsed) or {}
+
+    if MAAS_CLOUD not in controller_json("clouds", "clouds"):
+        log(f"registering testbed MAAS as Juju cloud {MAAS_CLOUD}")
+        cloud_yaml = (
+            f"clouds:\n  {MAAS_CLOUD}:\n    type: maas\n"
+            f"    auth-types: [oauth1]\n    endpoint: {MAAS_URL}\n"
+        )
+        vm_run(f"cat > /root/nt-cloud.yaml <<'EOF'\n{cloud_yaml}EOF")
+        vm_run(f"juju add-cloud {MAAS_CLOUD} -f /root/nt-cloud.yaml --client || true")
+        vm_run(
+            f"juju add-cloud {MAAS_CLOUD} -f /root/nt-cloud.yaml --controller {JUJU_CONTROLLER}"
+        )
+    if MAAS_CLOUD not in controller_json("credentials", "controller-credentials"):
+        log(f"adding MAAS credential for cloud {MAAS_CLOUD}")
+        key = vm_out(f"maas apikey --username {MAAS_CFG['admin_user']}")
+        cred_yaml = (
+            f"credentials:\n  {MAAS_CLOUD}:\n    admin:\n"
+            f"      auth-type: oauth1\n      maas-oauth: {key}\n"
+        )
+        vm_run(f"cat > /root/nt-cred.yaml <<'EOF'\n{cred_yaml}EOF")
+        # add-credential refuses when a client-local copy already exists, so
+        # clear any local copy and add straight to the controller
+        vm_run(f"juju remove-credential {MAAS_CLOUD} admin --client 2>/dev/null || true")
+        vm_run(
+            f"juju add-credential {MAAS_CLOUD} -f /root/nt-cred.yaml "
+            f"--controller {JUJU_CONTROLLER}"
+        )
+    log(f"Juju controller {JUJU_CONTROLLER} is up with cloud {MAAS_CLOUD} registered")
+
+
+def ensure_charm_packed():
+    """Pack the charm (host charmcraft preferred, VM fallback); return its filename."""
+    charm_dir = REPO_ROOT / "charm"
+    if shutil.which("charmcraft"):
+        log("packing charm on the host")
+        host_run(["charmcraft", "pack"], cwd=str(charm_dir))
+        charms = sorted(charm_dir.glob("*.charm"))
+        if not charms:
+            fatal("charmcraft pack produced no .charm file")
+        return charms[0].name
+    log("host has no charmcraft; packing inside the testbed VM (destructive mode)")
+    sync_tree()
+    vm_run(f"cd {VM_TREE}/charm && charmcraft pack --destructive-mode")
+    name = vm_out(f"ls {VM_TREE}/charm/*.charm | head -1")
+    if not name:
+        fatal("charmcraft pack inside the VM produced no .charm file")
+    return Path(name).name
+
+
 def sync_tree():
     log(f"syncing working tree to {VM}:{VM_TREE}")
-    vm_run(f"mkdir -p {VM_TREE}")
+    # recreate the tree so host-side deletions propagate; uv recreates the
+    # venvs from its cache in seconds
+    vm_run(f"rm -rf {VM_TREE} && mkdir -p {VM_TREE}")
     excludes = [f"--exclude={e}" for e in SYNC_EXCLUDES]
     tar_out = subprocess.Popen(
         ["tar", "-C", str(REPO_ROOT), *excludes, "-cf", "-", "."],
@@ -408,6 +499,7 @@ def cmd_up():
     ensure_vm_host()
     ensure_machines()
     sync_tree()
+    ensure_juju()
     report_ui_address()
     log("testbed is up")
 
@@ -564,7 +656,137 @@ def verify_topology():
     log("verify topology: PASS (dry-run roles/checks, fault, and recovery)")
 
 
-VERIFY_STAGES = {"foundation": verify_foundation, "topology": verify_topology}
+def vm_juju_models():
+    """Names of network-test-* models on the testbed controller."""
+    raw = vm_out("juju models --format json", check=False)
+    if not raw:
+        return []
+    names = []
+    for model in json.loads(raw).get("models", []):
+        name = model.get("short-name") or model.get("name", "")
+        name = name.split("/")[-1]
+        if name.startswith("network-test-"):
+            names.append(name)
+    return names
+
+
+def destroy_test_models():
+    for name in vm_juju_models():
+        log(f"destroying leftover model {name}")
+        vm_run(f"juju destroy-model --no-prompt --force --timeout 10m {name}")
+
+
+def wait_nodes_ready(timeout=900):
+    expected = {n["hostname"] for n in expected_nodes()}
+
+    def all_ready():
+        machines = maas_json("machines read")
+        states = {m["hostname"]: m["status_name"] for m in machines if m["hostname"] in expected}
+        log(f"machine states: {states}")
+        return len(states) == len(expected) and all(s == "Ready" for s in states.values())
+
+    wait_for("nodes to return to Ready in MAAS", all_ready, timeout=timeout, interval=20)
+
+
+def verify_skeleton():
+    """End-to-end walking-skeleton gate: deploy, probe, collect, report, teardown.
+
+    Runs the jubilant charm integration test against the testbed controller,
+    then the full `network-tester run --all` pipeline on the MAAS cloud
+    (auto-destroy path), then the --keep-model / status / --reuse-model path.
+    """
+    charm_name = ensure_charm_packed()
+    sync_tree()
+    ensure_juju()
+    destroy_test_models()
+    problems = []
+
+    log("verify skeleton: jubilant charm integration test (LXD-backed model)")
+    result = vm_run(
+        f"cd {VM_TREE}/charm && NT_CHARM_PATH={VM_TREE}/charm/{charm_name} "
+        "uv run --group integration pytest tests/integration -q",
+        check=False,
+        capture=True,
+    )
+    if result.returncode != 0:
+        problems.append(f"jubilant test failed:\n{result.stdout}\n{result.stderr}")
+
+    deploy_args = f"--charm charm/{charm_name} --cloud {MAAS_CLOUD} --wait-timeout 1800"
+    node_count = len(expected_nodes())
+
+    log("verify skeleton: full run with auto-destroy")
+    result = network_tester_run(f"--all {deploy_args}")
+    output = result.stdout + result.stderr
+    if result.returncode != 0:
+        problems.append(f"run --all exited {result.returncode}:\n{output}")
+    else:
+        for marker in (
+            "triggering probe run",
+            f"collecting results from {node_count} unit(s)",
+            "All 0 checks passed.",
+            "report written to ",
+            "destroying model network-test-",
+        ):
+            if marker not in output:
+                problems.append(f"run --all output missing '{marker}':\n{output}")
+        match = re.search(r"report written to (\S+network-test-\S+\.json)", output)
+        if match:
+            report_raw = vm_out(f"cat {shlex.quote(match.group(1))}", check=False)
+            try:
+                report = json.loads(report_raw)
+                if report.get("missing_nodes"):
+                    problems.append(f"report has missing nodes: {report['missing_nodes']}")
+                if report.get("schema_version") != "1":
+                    problems.append("report schema_version is not '1'")
+            except json.JSONDecodeError:
+                problems.append(f"report file is not valid JSON: {match.group(1)}")
+            text_report = match.group(1)[: -len(".json")] + ".txt"
+            if not vm_ok(f"test -f {shlex.quote(text_report)}"):
+                problems.append(f"text report missing: {text_report}")
+        if vm_juju_models():
+            problems.append(f"model not auto-destroyed: {vm_juju_models()}")
+        else:
+            wait_nodes_ready()
+
+    if not problems:
+        log("verify skeleton: keep-model run, status, and reuse-model re-trigger")
+        result = network_tester_run(f"--all --keep-model {deploy_args}")
+        output = result.stdout + result.stderr
+        match = re.search(r"Model (network-test-\S+) kept", output)
+        if result.returncode != 0 or not match:
+            problems.append(f"keep-model run failed ({result.returncode}):\n{output}")
+        else:
+            model = match.group(1)
+            status_out = vm_run(
+                f"cd {VM_TREE} && uv run network-tester status", check=False, capture=True
+            )
+            status_text = status_out.stdout + status_out.stderr
+            if status_out.returncode != 0 or model not in status_text:
+                problems.append(f"status does not show kept model {model}:\n{status_text}")
+            elif "probe complete" not in status_text:
+                problems.append(f"status does not show probe completion:\n{status_text}")
+
+            result = network_tester_run(f"--reuse-model {model} --wait-timeout 600")
+            output = result.stdout + result.stderr
+            if result.returncode != 0 or "All 0 checks passed." not in output:
+                problems.append(f"reuse-model run failed ({result.returncode}):\n{output}")
+
+            log(f"destroying kept model {model}")
+            vm_run(f"juju destroy-model --no-prompt --force --timeout 15m {model}", check=False)
+            wait_nodes_ready()
+
+    if problems:
+        for problem in problems:
+            log(f"FAIL: {problem}")
+        sys.exit(1)
+    log("verify skeleton: PASS (jubilant test, full pipeline, keep/status/reuse)")
+
+
+VERIFY_STAGES = {
+    "foundation": verify_foundation,
+    "topology": verify_topology,
+    "skeleton": verify_skeleton,
+}
 
 
 # --- faults -------------------------------------------------------------------

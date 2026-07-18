@@ -3,9 +3,13 @@
 Single-machine nested-virtualization testbed (design D18). Everything runs
 inside one outer LXD VM named `nt-testbed`: MAAS (region+rack snap backed by
 the `maas-test-db` snap), an inner LXD registered as a MAAS VM host that
-composes the node VMs, and Open vSwitch bridges acting as ToR switches.
-The testbed VM also plays the operator-workstation role: the working tree is
-synced into it and the network-tester CLI runs from there.
+composes the node VMs, Open vSwitch bridges acting as ToR switches, and a
+Juju controller bootstrapped on the inner LXD with the testbed MAAS
+registered as the `maas-testbed` cloud. The controller container sits on the
+management/PXE bridge, outside the topology under test, so data-fabric fault
+injection cannot sever Juju connectivity. The testbed VM also plays the
+operator-workstation role: the working tree is synced into it and the
+network-tester CLI runs from there.
 
 ## Host prerequisites
 
@@ -31,6 +35,8 @@ the mismatch and you rebuild with `nt-testbed down && nt-testbed up`.
 ```sh
 testbed/nt-testbed up                  # create/refresh everything (idempotent)
 testbed/nt-testbed verify foundation   # assert composed machines are Ready
+testbed/nt-testbed verify topology     # dry-run + pre-flight fault round-trip
+testbed/nt-testbed verify skeleton     # full deploy/probe/collect/report cycle
 testbed/nt-testbed status              # VM / MAAS / machine state
 testbed/nt-testbed shell               # shell inside the testbed VM
 testbed/nt-testbed fault clear         # restore topology (faults arrive in later stages)
@@ -61,3 +67,14 @@ and not testbed state.
   data VLANs, bonds, rack 2, and inter-rack links.
 - `nt-testbed` - idempotent entry script (Python, runs via uv). Later stages
   only add `verify` stages and `fault` cases.
+
+## verify skeleton
+
+`verify skeleton` exercises the full walking-skeleton pipeline inside the
+VM: it packs the charm (on the host when charmcraft is available, otherwise
+inside the VM with `--destructive-mode`), runs the jubilant charm
+integration test against an LXD-backed model, then runs
+`network-tester run --all` on the `maas-testbed` cloud twice - once
+verifying report files, model auto-destroy, and nodes returning to Ready;
+once with `--keep-model` followed by `status` and `--reuse-model`. Each
+MAAS deploy cycle takes 10-25 minutes on nested virtualization.
