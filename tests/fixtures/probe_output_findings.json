@@ -1,0 +1,109 @@
+{
+  "schema_version": "1",
+  "status": "complete",
+  "node": {
+    "system_id": "aaa001",
+    "hostname": "r1-data-01",
+    "rack": "rack-1",
+    "role": "data",
+    "interfaces": [
+      {"name": "bond0", "mac": "52:54:00:01:01:01"},
+      {"name": "eno1", "mac": "52:54:00:01:01:01"},
+      {"name": "eno2", "mac": "52:54:00:01:01:02"}
+    ]
+  },
+  "bond_validator": {
+    "validator_status": "complete",
+    "bonds": [
+      {
+        "bond": "bond0",
+        "configured_mode": "802.3ad",
+        "lacp_active": true,
+        "bond_mode": "fail",
+        "bond_cabling": "unknown",
+        "members": [
+          {"interface": "eno1", "lacp_advertised": false, "pdus": []},
+          {"interface": "eno2", "lacp_advertised": false, "pdus": []}
+        ]
+      }
+    ],
+    "findings": [
+      {
+        "type": "bond-mode-mismatch",
+        "classification": "definitive",
+        "scope": "interface",
+        "hint": "Switch port may be configured for static bonding; verify switch port-channel mode",
+        "details": {
+          "bond": "bond0",
+          "configured_mode": "802.3ad",
+          "lacp_advertised": false,
+          "interfaces": ["eno1", "eno2"]
+        }
+      }
+    ]
+  },
+  "vlan_neighbor_validator": {
+    "validator_status": "complete",
+    "findings": [
+      {
+        "type": "unexpected-l2-neighbor",
+        "classification": "definitive",
+        "scope": "interface",
+        "hint": "Unexpected L2 neighbor MAC 52:54:00:99:99:99 (IP 10.20.1.99) on interface bond0; this device is not in the expected topology for this VLAN",
+        "details": {
+          "interface": "bond0",
+          "mac": "52:54:00:99:99:99",
+          "ip": "10.20.1.99"
+        }
+      }
+    ],
+    "observations": []
+  },
+  "mtu_validator": {
+    "validator_status": "complete",
+    "cross_rack_mtu": [
+      {
+        "source_rack": "rack-1",
+        "source_node": "aaa001",
+        "target_rack": "rack-2",
+        "target_node": "bbb001",
+        "observed_path_mtu_bytes": null,
+        "observation_status": "inconclusive",
+        "note": "ICMP may be filtered on this path; manual MTU verification required"
+      }
+    ],
+    "findings": []
+  },
+  "bgp_inference": {
+    "validator_status": "complete",
+    "paths": [
+      {
+        "source_rack": "rack-1",
+        "source_node": "aaa001",
+        "target_rack": "rack-2",
+        "representative_target": "bbb001",
+        "fallback_target": "bbb002",
+        "reachable": false,
+        "target_role": null,
+        "observation_status": "failure",
+        "finding": {
+          "type": "likely-bgp-failure",
+          "classification": "inferred",
+          "scope": "rack-pair",
+          "hint": "Traffic from rack-1 stops at ToR (10.20.1.1); BGP session between rack-1 ToR and upstream may be down. Verify BGP configuration and peering on the ToR switch.",
+          "details": {
+            "diagnosis_confidence": "inferred",
+            "last_responding_hop": "10.20.1.1",
+            "traceroute_truncated": false
+          }
+        },
+        "traceroute_hops": [
+          {"hop": 1, "ip": "10.20.1.1", "rtt_ms": 0.4},
+          {"hop": 2, "ip": null, "rtt_ms": null},
+          {"hop": 3, "ip": null, "rtt_ms": null}
+        ]
+      }
+    ],
+    "findings": []
+  }
+}

@@ -1,0 +1,65 @@
+{
+  "schema_version": "1",
+  "status": "timeout",
+  "node": {
+    "system_id": "aaa001",
+    "hostname": "r1-data-01",
+    "rack": "rack-1",
+    "role": "data",
+    "interfaces": [
+      {"name": "bond0", "mac": "52:54:00:01:01:01"},
+      {"name": "eno1", "mac": "52:54:00:01:01:01"},
+      {"name": "eno2", "mac": "52:54:00:01:01:02"}
+    ]
+  },
+  "bond_validator": {
+    "validator_status": "complete",
+    "bonds": [
+      {
+        "bond": "bond0",
+        "configured_mode": "802.3ad",
+        "lacp_active": true,
+        "bond_mode": "pass",
+        "bond_cabling": "pass",
+        "members": [
+          {"interface": "eno1", "lacp_advertised": true, "pdus": []},
+          {"interface": "eno2", "lacp_advertised": true, "pdus": []}
+        ]
+      }
+    ],
+    "findings": []
+  },
+  "vlan_neighbor_validator": {
+    "validator_status": "complete",
+    "findings": [],
+    "observations": []
+  },
+  "mtu_validator": {
+    "validator_status": "timeout",
+    "timeout_reason": "probe-timeout elapsed during cross-rack MTU probing",
+    "cross_rack_mtu": [
+      {
+        "source_rack": "rack-1",
+        "source_node": "aaa001",
+        "target_rack": "rack-2",
+        "target_node": "bbb001",
+        "observed_path_mtu_bytes": 1500,
+        "observation_status": "success"
+      },
+      {
+        "source_rack": "rack-1",
+        "source_node": "aaa001",
+        "target_rack": "rack-3",
+        "target_node": "ccc001",
+        "observed_path_mtu_bytes": null,
+        "observation_status": "timeout"
+      }
+    ],
+    "findings": []
+  },
+  "bgp_inference": {
+    "validator_status": "not_started",
+    "paths": [],
+    "findings": []
+  }
+}

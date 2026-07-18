@@ -1,0 +1,112 @@
+{
+  "schema_version": "1",
+  "generated_at": "2026-06-11T12:00:00+00:00",
+  "summary": {
+    "passed_count": 12,
+    "failed": 2,
+    "skipped": 2,
+    "inconclusive": 1,
+    "warnings": 2
+  },
+  "definitive_failures": [
+    {
+      "type": "bond-mode-mismatch",
+      "classification": "definitive",
+      "scope": "interface",
+      "hint": "Switch port may be configured for static bonding; verify switch port-channel mode",
+      "details": {
+        "system_id": "aaa001",
+        "hostname": "r1-data-01",
+        "bond": "bond0",
+        "configured_mode": "802.3ad",
+        "lacp_advertised": false
+      }
+    },
+    {
+      "type": "unexpected-l2-neighbor",
+      "classification": "definitive",
+      "scope": "interface",
+      "hint": "Unexpected L2 neighbor MAC 52:54:00:99:99:99 (IP 10.20.1.99) on interface bond0; this device is not in the expected topology for this VLAN",
+      "details": {
+        "system_id": "aaa001",
+        "hostname": "r1-data-01",
+        "interface": "bond0",
+        "mac": "52:54:00:99:99:99",
+        "ip": "10.20.1.99"
+      }
+    }
+  ],
+  "inferred_failures": [
+    {
+      "type": "likely-bgp-failure",
+      "classification": "inferred",
+      "scope": "rack-pair",
+      "hint": "Traffic between rack-1 and rack-2 stops at the local ToR in both directions; BGP session between the ToRs may be down. Verify BGP configuration and peering.",
+      "details": {
+        "rack_pair": ["rack-1", "rack-2"],
+        "observed_by": ["aaa001", "bbb001"],
+        "traceroute": {
+          "aaa001": [{"hop": 1, "ip": "10.20.1.1", "rtt_ms": 0.4}],
+          "bbb001": [{"hop": 1, "ip": "10.20.2.1", "rtt_ms": 0.5}]
+        }
+      }
+    }
+  ],
+  "warnings": [
+    {
+      "type": "unidirectional-observation",
+      "scope": "node",
+      "message": "Node aaa001 recorded node aaa002 but aaa002 did not record aaa001 - possible asymmetric path or probe timing issue",
+      "details": {"source": "aaa001", "peer": "aaa002"}
+    },
+    {
+      "type": "asymmetric-mtu-observation",
+      "scope": "rack-pair",
+      "message": "Rack-pair rack-1/rack-2 MTU observations disagree: 9000 (rack-1 to rack-2) vs 1500 (rack-2 to rack-1)",
+      "details": {"rack_pair": ["rack-1", "rack-2"], "observed": {"rack-1": 9000, "rack-2": 1500}}
+    }
+  ],
+  "inconclusive_checks": [
+    {
+      "type": "cross-rack-mtu",
+      "scope": "rack-pair",
+      "message": "Expected MTU path rack-1 to rack-3 was not attempted (validator timeout)",
+      "details": {"rack_pair": ["rack-1", "rack-3"], "observation_status": "timeout"}
+    }
+  ],
+  "skipped_checks": [
+    {
+      "peer": "aaa003",
+      "count": 2,
+      "message": "2 checks skipped - add aaa003 to test these paths"
+    },
+    {
+      "peer": "bbb001",
+      "count": 3,
+      "message": "3 checks skipped - add bbb001 to test these paths"
+    }
+  ],
+  "observations": [
+    {
+      "type": "cross-rack-mtu",
+      "source_node": "aaa001",
+      "source_rack": "rack-1",
+      "target_node": "bbb001",
+      "target_rack": "rack-2",
+      "observed_path_mtu_bytes": 9000,
+      "observation_status": "success"
+    }
+  ],
+  "missing_nodes": [
+    {
+      "system_id": "bbb003",
+      "hostname": "r2-data-03",
+      "reason": "deployment-timeout"
+    },
+    {
+      "system_id": "ccc001",
+      "hostname": "r3-data-01",
+      "reason": "no-probe-output"
+    }
+  ]
+}

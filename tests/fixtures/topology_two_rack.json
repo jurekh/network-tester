@@ -1,0 +1,184 @@
+{
+  "schema_version": "1",
+  "scope": {"mode": "all", "args": []},
+  "fabrics": [
+    {"name": "fabric-mgmt", "class": "management"},
+    {"name": "fabric-data", "class": "data"}
+  ],
+  "machines": [
+    {
+      "system_id": "rc0001",
+      "hostname": "rack1-controller",
+      "rack": "rack-1",
+      "role": "rack-controller",
+      "in_scope": false,
+      "interfaces": [
+        {
+          "name": "eth0",
+          "type": "physical",
+          "mac": "52:54:00:01:00:01",
+          "fabric": "fabric-mgmt",
+          "fabric_class": "management",
+          "vlan_tag": 10,
+          "subnet_cidr": "10.10.1.0/24",
+          "ip": "10.10.1.2",
+          "gateway_ip": "10.10.1.1"
+        }
+      ]
+    },
+    {
+      "system_id": "rc0002",
+      "hostname": "rack2-controller",
+      "rack": "rack-2",
+      "role": "rack-controller",
+      "in_scope": false,
+      "interfaces": [
+        {
+          "name": "eth0",
+          "type": "physical",
+          "mac": "52:54:00:02:00:01",
+          "fabric": "fabric-mgmt",
+          "fabric_class": "management",
+          "vlan_tag": 10,
+          "subnet_cidr": "10.10.2.0/24",
+          "ip": "10.10.2.2",
+          "gateway_ip": "10.10.2.1"
+        }
+      ]
+    },
+    {
+      "system_id": "aaa001",
+      "hostname": "r1-data-01",
+      "rack": "rack-1",
+      "role": "data",
+      "in_scope": true,
+      "interfaces": [
+        {
+          "name": "bond0",
+          "type": "bond",
+          "mac": "52:54:00:01:01:01",
+          "bond_mode": "802.3ad",
+          "bond_members": [
+            {"name": "eno1", "mac": "52:54:00:01:01:01"},
+            {"name": "eno2", "mac": "52:54:00:01:01:02"}
+          ],
+          "fabric": "fabric-data",
+          "fabric_class": "data",
+          "vlan_tag": 100,
+          "subnet_cidr": "10.20.1.0/24",
+          "ip": "10.20.1.11",
+          "gateway_ip": "10.20.1.1"
+        }
+      ]
+    },
+    {
+      "system_id": "aaa002",
+      "hostname": "r1-data-02",
+      "rack": "rack-1",
+      "role": "data",
+      "in_scope": true,
+      "interfaces": [
+        {
+          "name": "eth0",
+          "type": "physical",
+          "mac": "52:54:00:01:02:01",
+          "fabric": "fabric-data",
+          "fabric_class": "data",
+          "vlan_tag": 100,
+          "subnet_cidr": "10.20.1.0/24",
+          "ip": "10.20.1.12",
+          "gateway_ip": "10.20.1.1"
+        }
+      ]
+    },
+    {
+      "system_id": "bbb001",
+      "hostname": "r2-data-01",
+      "rack": "rack-2",
+      "role": "data",
+      "in_scope": true,
+      "interfaces": [
+        {
+          "name": "eth0",
+          "type": "physical",
+          "mac": "52:54:00:02:01:01",
+          "fabric": "fabric-data",
+          "fabric_class": "data",
+          "vlan_tag": 200,
+          "subnet_cidr": "10.20.2.0/24",
+          "ip": "10.20.2.11",
+          "gateway_ip": "10.20.2.1"
+        }
+      ]
+    },
+    {
+      "system_id": "bbb002",
+      "hostname": "r2-data-02",
+      "rack": "rack-2",
+      "role": "data",
+      "in_scope": true,
+      "interfaces": [
+        {
+          "name": "eth0",
+          "type": "physical",
+          "mac": "52:54:00:02:02:01",
+          "fabric": "fabric-data",
+          "fabric_class": "data",
+          "vlan_tag": 200,
+          "subnet_cidr": "10.20.2.0/24",
+          "ip": "10.20.2.12",
+          "gateway_ip": "10.20.2.1"
+        }
+      ]
+    },
+    {
+      "system_id": "bbb003",
+      "hostname": "r2-data-03",
+      "rack": "rack-2",
+      "role": "data",
+      "in_scope": true,
+      "interfaces": [
+        {
+          "name": "eth0",
+          "type": "physical",
+          "mac": "52:54:00:02:03:01",
+          "fabric": "fabric-data",
+          "fabric_class": "data",
+          "vlan_tag": 200,
+          "subnet_cidr": "10.20.2.0/24",
+          "ip": "10.20.2.13",
+          "gateway_ip": "10.20.2.1"
+        }
+      ]
+    }
+  ],
+  "reachability_model": {
+    "rules": {
+      "l2-same-fabric-vlan": {
+        "id": "l2-same-fabric-vlan",
+        "description": "Machines sharing a fabric name and vlan_tag are expected L2 peers unless a role rule forbids the adjacency.",
+        "applicable_roles": ["rack-controller", "bmc-oam", "data"],
+        "parameters": {}
+      },
+      "bmc-oam-restricted": {
+        "id": "bmc-oam-restricted",
+        "description": "A bmc-oam node's expected peer set is only the rack-controller in its rack; other same-VLAN adjacency is forbidden.",
+        "applicable_roles": ["bmc-oam"],
+        "parameters": {"allowed_peer_roles": ["rack-controller"], "same_rack_only": true}
+      },
+      "cross-rack-data-routing": {
+        "id": "cross-rack-data-routing",
+        "description": "Data machines in different racks are expected L3-reachable via data-fabric interfaces; v1 active checks are representative-sampled rack-pair probes.",
+        "applicable_roles": ["data"],
+        "parameters": {
+          "probe_scope": "rack-pair-representative",
+          "applicable_role": "data",
+          "interface_class": "data",
+          "source_selection": {"strategy": "lexicographic-lowest", "field": "system_id", "in_scope": true},
+          "target_selection": {"strategy": "lexicographic-lowest", "field": "system_id", "in_scope": true},
+          "fallback_selection": {"strategy": "next-lexicographic", "field": "system_id", "in_scope": true}
+        }
+      }
+    }
+  }
+}

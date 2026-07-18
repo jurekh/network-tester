@@ -4,19 +4,19 @@ Execution is organized into stages. Each stage delivers a vertical slice of the 
 
 ## 1. Foundations: Packaging, Repo Layout, Shared Contracts
 
-- [ ] 1.1 Define project packaging before implementation: `pyproject.toml` with uv-managed dependency groups, pytest config, charmcraft.yaml, Makefile targets, and CI commands
-- [ ] 1.2 Initialise Juju machine charm with `charmcraft init --profile machine` in `charm/`
-- [ ] 1.3 Create probe payload layout under charm source: `charm/payload/probe.py` (entry point), `charm/payload/bond_validator.py`, `charm/payload/vlan_neighbor_validator.py`, `charm/payload/mtu_validator.py`, `charm/payload/bgp_inference.py`, `charm/payload/probe_runner.py`, `tests/`
-- [ ] 1.4 Define peer relation `network-tester-peers` in `charm/metadata.yaml`
-- [ ] 1.5 Declare `topology` Juju resource (type: file, required) in `charm/metadata.yaml`; no `mac-manifest` or payload charm resources (manifest is CLI-side only; payload is packaged in charm source)
-- [ ] 1.6 Add charm config options: `probe-run-id` (default empty string), `probe-timeout` (default 240, seconds; must stay below the 300s Juju hook timeout with flush margin)
-- [ ] 1.7 Add charm action: `collect-results` in `charm/actions.yaml`
-- [ ] 1.8 Add Python dependencies in the correct components: charm requirements for `ops`; CLI requirements for MAAS API and Juju client libraries; no scapy
-- [ ] 1.9 Add `Makefile` with targets: `test`, `lint`, `build` (charmcraft pack), `clean`
-- [ ] 1.10 Probe runtime dependencies are all in Ubuntu main; `tcpdump`, `arping` (iputils-arping), and `traceroute` must be installed by the charm's install hook via `apt install -y tcpdump iputils-arping traceroute`; `ping` is provided by iputils-ping
-- [ ] 1.11 Define shared versioned topology/probe-output/report schemas and golden fixtures before implementing validators; include mixed in-scope/out-of-scope and mixed management+data host examples; the schemas must define the structured `reachability_model` block (named rules: `l2-same-fabric-vlan`, `bmc-oam-restricted`, `cross-rack-data-routing` with machine-readable deterministic source/target rack representative selection), per-validator `validator_status`, cross-rack path observation records (`bgp_inference.paths[]`, `mtu_validator.cross_rack_mtu[]`), and the common finding envelope (`type`, `classification`, `scope`, `hint`, `details`)
-- [ ] 1.12 Implement representative selection (source/target/fallback derivation from the machines list and the structured `cross-rack-data-routing` parameters) once, in a module shared by mtu-validator, bgp-inference, and the CLI report-generator; if charm payload packaging prevents importing a shared package, duplicate the function and add a cross-implementation golden-fixture test asserting both produce identical selections for every fixture topology
-- [ ] 1.13 **Gate:** `make lint test` passes (schema/fixture and representative-selection tests green); `charmcraft pack` produces a charm artifact
+- [x] 1.1 Define project packaging before implementation: `pyproject.toml` with uv-managed dependency groups, pytest config, charmcraft.yaml, Makefile targets, and CI commands
+- [x] 1.2 Initialise Juju machine charm with `charmcraft init --profile machine` in `charm/`
+- [x] 1.3 Create probe payload layout under charm source: `charm/payload/probe.py` (entry point), `charm/payload/bond_validator.py`, `charm/payload/vlan_neighbor_validator.py`, `charm/payload/mtu_validator.py`, `charm/payload/bgp_inference.py`, `charm/payload/probe_runner.py`, `tests/`
+- [x] 1.4 Define peer relation `network-tester-peers` in `charm/metadata.yaml`
+- [x] 1.5 Declare `topology` Juju resource (type: file, required) in `charm/metadata.yaml`; no `mac-manifest` or payload charm resources (manifest is CLI-side only; payload is packaged in charm source)
+- [x] 1.6 Add charm config options: `probe-run-id` (default empty string), `probe-timeout` (default 240, seconds; must stay below the 300s Juju hook timeout with flush margin)
+- [x] 1.7 Add charm action: `collect-results` in `charm/actions.yaml`
+- [x] 1.8 Add Python dependencies in the correct components: charm requirements for `ops`; CLI requirements for MAAS API and Juju client libraries; no scapy
+- [x] 1.9 Add `Makefile` with targets: `test`, `lint`, `build` (charmcraft pack), `clean`
+- [x] 1.10 Probe runtime dependencies are all in Ubuntu main; `tcpdump`, `arping` (iputils-arping), and `traceroute` must be installed by the charm's install hook via `apt install -y tcpdump iputils-arping traceroute`; `ping` is provided by iputils-ping
+- [x] 1.11 Define shared versioned topology/probe-output/report schemas and golden fixtures before implementing validators; include mixed in-scope/out-of-scope and mixed management+data host examples; the schemas must define the structured `reachability_model` block (named rules: `l2-same-fabric-vlan`, `bmc-oam-restricted`, `cross-rack-data-routing` with machine-readable deterministic source/target rack representative selection), per-validator `validator_status`, cross-rack path observation records (`bgp_inference.paths[]`, `mtu_validator.cross_rack_mtu[]`), and the common finding envelope (`type`, `classification`, `scope`, `hint`, `details`)
+- [x] 1.12 Implement representative selection (source/target/fallback derivation from the machines list and the structured `cross-rack-data-routing` parameters) once, in a module shared by mtu-validator, bgp-inference, and the CLI report-generator; if charm payload packaging prevents importing a shared package, duplicate the function and add a cross-implementation golden-fixture test asserting both produce identical selections for every fixture topology
+- [x] 1.13 **Gate:** `make lint test` passes (schema/fixture and representative-selection tests green); `charmcraft pack` produces a charm artifact
 
 ## 2. Testbed Foundation: Nested MAAS on a Single Machine
 

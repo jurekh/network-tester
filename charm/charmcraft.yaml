@@ -1,0 +1,78 @@
+# This file configures Charmcraft.
+# See https://documentation.ubuntu.com/charmcraft/stable/reference/files/charmcraft-yaml-file/
+type: charm
+name: network-tester
+title: Network Tester
+summary: Ephemeral probe charm that validates datacenter network cabling against MAAS topology.
+description: |
+  Probe charm deployed ephemerally to MAAS machines to validate physical
+  cabling and network configuration against the intended topology fetched
+  from MAAS: bond/LACP state, VLAN neighbor sets, cross-rack path MTU, and
+  inferred BGP reachability between racks.
+
+  Each unit reads the topology from the attached Juju resource, resolves its
+  own identity by MAC matching, and runs a self-contained probe payload when
+  the leader propagates a new probe-run-id over the peer relation. Results
+  are retrieved per unit with the collect-results action.
+
+base: ubuntu@24.04
+platforms:
+  amd64:
+
+assumes:
+  - juju >= 3.6
+
+parts:
+  charm:
+    plugin: uv
+    source: .
+    build-snaps:
+      - astral-uv
+    prime:
+      - -src/__pycache__
+  # The probe payload is plain stdlib Python invoked from the installed charm
+  # source (payload/probe.py); it is packaged with the charm, not as a resource.
+  payload:
+    plugin: dump
+    source: .
+    stage:
+      - payload/
+      - -payload/__pycache__
+
+peers:
+  network-tester-peers:
+    interface: network-tester-peer
+
+resources:
+  topology:
+    type: file
+    filename: topology.json
+    description: |
+      Topology JSON produced by the network-tester CLI from the MAAS API.
+      Required: each unit reads it during install to resolve its own identity
+      and derive expected peers. Attached by the CLI at deploy time.
+
+config:
+  options:
+    probe-run-id:
+      description: |
+        Unique identifier for a probe run (set by the CLI, e.g. YYYYMMDD-HHMMSS).
+        When the leader sees a non-empty value it propagates it to peer relation
+        data; units run the probe payload when the relation value differs from
+        their last executed run-id. Empty means no probe run is requested.
+      default: ""
+      type: string
+    probe-timeout:
+      description: |
+        Overall probe payload timeout in seconds. Must stay below the Juju hook
+        timeout (300s default) with margin for the payload's 5-second partial
+        result flush window.
+      default: 240
+      type: int
+
+actions:
+  collect-results:
+    description: |
+      Return the unit's probe output JSON (/var/log/network-tester/probe-output.json).
+      Returns {"status": "missing", "unit": "<unit-name>"} without error when the
+      probe output file does not exist.

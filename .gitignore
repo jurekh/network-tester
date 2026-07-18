@@ -1,1 +1,10 @@
 .claude/settings.local.json
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.charm
+*.egg-info/
+network-test-*.json
+network-test-*.txt
