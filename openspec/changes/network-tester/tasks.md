@@ -20,14 +20,14 @@ Execution is organized into stages. Each stage delivers a vertical slice of the 
 
 ## 2. Testbed Foundation: Nested MAAS on a Single Machine
 
-- [ ] 2.1 Create `testbed/` with a declarative topology config (`testbed/topology.yaml`: racks, nodes per rack with CPU/RAM, NICs, VLANs, subnets, bonds, inter-rack links) and an idempotent `testbed/nt-testbed` entry script with subcommands `up`, `down`, `status`, `shell`, `verify <stage>`, `fault <name> [args]`, `fault clear`; later stages only extend the config and add `verify`/`fault` cases
-- [ ] 2.2 `up`: launch outer LXD VM `nt-testbed` (Ubuntu 24.04, default profile 8 CPU / 16GiB RAM / 100GiB disk, configurable in topology.yaml); assert nested KVM is available inside (`/dev/kvm` present); document host prerequisites in `testbed/README.md` (LXD installed, ~24GB free RAM and ~100GB disk for the default profile, reduced-profile guidance for smaller hosts)
-- [ ] 2.3 Inside the testbed VM: install the `maas` and `maas-test-db` snaps, inner LXD, and `openvswitch-switch`; run `maas init region+rack --database-uri maas-test-db:///` and create an admin user with API key (maas-test-db is the deliberate choice over external PostgreSQL: the testbed is disposable and recreated from scratch, so production-grade DB setup buys nothing); create OVS bridge `br-rack1` and an inner LXD network on it for PXE; enable MAAS DHCP on the PXE subnet
-- [ ] 2.4 Register the inner LXD as a MAAS VM host; compose 2 data-node VMs (2 CPU / 2GiB) attached to `br-rack1`; commission them; `up` waits until both reach `Ready`
-- [ ] 2.5 Run the network-tester CLI and Juju client from inside the testbed VM (the testbed VM is the operator-workstation analog); `shell` wraps `lxc exec nt-testbed`; sync the working tree into the VM (e.g. rsync or a shared directory) and create the uv venv there; optionally add an LXD proxy device exposing the MAAS UI to the host for debugging
-- [ ] 2.6 `verify foundation`: query the MAAS API and assert exactly the composed machines are `Ready` with the expected interface and subnet records
-- [ ] 2.7 `down`: `lxc delete --force nt-testbed`; assert no host-side leftovers (no extra bridges, profiles, or files outside the repo)
-- [ ] 2.8 **Gate:** `nt-testbed up && nt-testbed verify foundation && nt-testbed down` passes from a clean host
+- [x] 2.1 Create `testbed/` with a declarative topology config (`testbed/topology.yaml`: racks, nodes per rack with CPU/RAM, NICs, VLANs, subnets, bonds, inter-rack links) and an idempotent `testbed/nt-testbed` entry script with subcommands `up`, `down`, `status`, `shell`, `verify <stage>`, `fault <name> [args]`, `fault clear`; later stages only extend the config and add `verify`/`fault` cases
+- [x] 2.2 `up`: launch outer LXD VM `nt-testbed` (Ubuntu 24.04, default profile 8 CPU / 16GiB RAM / 100GiB disk, configurable in topology.yaml); assert nested KVM is available inside (`/dev/kvm` present); document host prerequisites in `testbed/README.md` (LXD installed, ~24GB free RAM and ~100GB disk for the default profile, reduced-profile guidance for smaller hosts)
+- [x] 2.3 Inside the testbed VM: install the `maas` and `maas-test-db` snaps, inner LXD, and `openvswitch-switch`; run `maas init region+rack --database-uri maas-test-db:///` and create an admin user with API key (maas-test-db is the deliberate choice over external PostgreSQL: the testbed is disposable and recreated from scratch, so production-grade DB setup buys nothing); create OVS bridge `br-rack1` and an inner LXD network on it for PXE; enable MAAS DHCP on the PXE subnet
+- [x] 2.4 Register the inner LXD as a MAAS VM host; compose 2 data-node VMs (2 CPU / 2GiB) attached to `br-rack1`; commission them; `up` waits until both reach `Ready`
+- [x] 2.5 Run the network-tester CLI and Juju client from inside the testbed VM (the testbed VM is the operator-workstation analog); `shell` wraps `lxc exec nt-testbed`; sync the working tree into the VM (e.g. rsync or a shared directory) and create the uv venv there; optionally add an LXD proxy device exposing the MAAS UI to the host for debugging
+- [x] 2.6 `verify foundation`: query the MAAS API and assert exactly the composed machines are `Ready` with the expected interface and subnet records
+- [x] 2.7 `down`: `lxc delete --force nt-testbed`; assert no host-side leftovers (no extra bridges, profiles, or files outside the repo)
+- [x] 2.8 **Gate:** `nt-testbed up && nt-testbed verify foundation && nt-testbed down` passes from a clean host
 
 ## 3. Topology Fetcher and Read-Only CLI
 

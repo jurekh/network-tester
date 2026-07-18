@@ -1,0 +1,544 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["pyyaml"]
+# ///
+"""nt-testbed: nested-virtualization testbed for network-tester (design D18).
+
+The whole testbed lives inside one outer LXD VM. Inside it: MAAS (region+rack
+snap with maas-test-db), an inner LXD registered as a MAAS VM host that
+composes the node VMs, and Open vSwitch bridges acting as ToR switches.
+The host needs only LXD and uv; `nt-testbed down` removes all testbed state.
+
+Subcommands: up, down, status, shell, verify <stage>, fault <name> [args],
+fault clear. Configuration lives in topology.yaml next to this script.
+"""
+
+import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import yaml
+
+TESTBED_DIR = Path(__file__).resolve().parent
+REPO_ROOT = TESTBED_DIR.parent
+CONFIG = yaml.safe_load((TESTBED_DIR / "topology.yaml").read_text())
+
+VM = CONFIG["vm"]["name"]
+PXE = CONFIG["pxe"]
+MAAS_CFG = CONFIG["maas"]
+MAAS_URL = f"http://{PXE['gateway']}:5240/MAAS"
+VM_TREE = "/root/network-tester"
+
+SYNC_EXCLUDES = [
+    ".git",
+    ".venv",
+    "charm/.venv",
+    ".pytest_cache",
+    ".ruff_cache",
+    "__pycache__",
+]
+
+
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def fatal(msg):
+    log(f"FATAL: {msg}")
+    sys.exit(1)
+
+
+def host_run(args, check=True, capture=False):
+    result = subprocess.run(args, check=False, text=True, capture_output=capture)
+    if check and result.returncode != 0:
+        fatal(
+            f"command failed ({result.returncode}): {shlex.join(args)}\n"
+            f"{(result.stderr or '') if capture else ''}"
+        )
+    return result
+
+
+def vm_run(script, check=True, capture=False):
+    """Run a bash script inside the testbed VM."""
+    return host_run(["lxc", "exec", VM, "--", "bash", "-c", script], check=check, capture=capture)
+
+
+def vm_out(script, check=True):
+    return vm_run(script, check=check, capture=True).stdout.strip()
+
+
+def vm_ok(script):
+    return vm_run(script, check=False, capture=True).returncode == 0
+
+
+def maas_json(cmd, check=True):
+    """Run a maas CLI command inside the VM and parse its JSON output."""
+    result = vm_run(f"maas {MAAS_CFG['admin_user']} {cmd}", check=check, capture=True)
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        if check:
+            fatal(f"maas {cmd}: expected JSON, got:\n{result.stdout[:2000]}")
+        return None
+
+
+def wait_for(desc, predicate, timeout, interval=10):
+    log(f"waiting for {desc} (timeout {timeout}s)")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = predicate()
+        if result:
+            return result
+        time.sleep(interval)
+    fatal(f"timed out waiting for {desc}")
+
+
+def expected_nodes():
+    nodes = []
+    for rack in CONFIG["racks"].values():
+        nodes.extend(rack["nodes"])
+    return nodes
+
+
+# --- up steps ----------------------------------------------------------------
+
+
+def vm_exists():
+    result = host_run(["lxc", "list", VM, "--format", "json"], capture=True)
+    return any(i["name"] == VM for i in json.loads(result.stdout))
+
+
+def ensure_vm():
+    if vm_exists():
+        log(f"VM {VM} already exists")
+        host_run(["lxc", "start", VM], check=False, capture=True)
+    else:
+        cfg = CONFIG["vm"]
+        log(f"launching VM {VM} ({cfg['cpu']} CPU, {cfg['memory']}, {cfg['disk']} disk)")
+        host_run(
+            [
+                "lxc",
+                "launch",
+                cfg["image"],
+                VM,
+                "--vm",
+                "-c",
+                f"limits.cpu={cfg['cpu']}",
+                "-c",
+                f"limits.memory={cfg['memory']}",
+                "-d",
+                f"root,size={cfg['disk']}",
+            ]
+        )
+    wait_for(
+        "VM agent",
+        lambda: (
+            host_run(["lxc", "exec", VM, "--", "true"], check=False, capture=True).returncode == 0
+        ),
+        timeout=300,
+        interval=5,
+    )
+    vm_run("cloud-init status --wait >/dev/null || true")
+    if not vm_ok("test -e /dev/kvm"):
+        fatal(
+            "nested KVM is not available inside the testbed VM (/dev/kvm missing); "
+            "the host must support nested virtualization"
+        )
+    log("VM is up with nested KVM available")
+
+
+def ensure_packages():
+    maas_channel = MAAS_CFG.get("channel")
+    for snap, channel, args in (
+        ("maas-test-db", maas_channel, ""),
+        ("maas", maas_channel, ""),
+        ("lxd", None, ""),
+        ("astral-uv", None, "--classic"),
+    ):
+        if vm_ok(f"snap list {snap} >/dev/null 2>&1"):
+            if channel:
+                tracking = vm_out(f"snap list {snap} | awk 'NR==2 {{print $4}}'")
+                if tracking != channel:
+                    log(
+                        f"note: snap {snap} tracks {tracking} but topology.yaml wants "
+                        f"{channel}; run `nt-testbed down && nt-testbed up` to rebuild"
+                    )
+            continue
+        flag = f" --channel={channel}" if channel else ""
+        log(f"installing snap {snap}{flag.replace('=', ' ')}")
+        vm_run(f"snap install {snap}{flag} {args}")
+    if not vm_ok("dpkg -s openvswitch-switch >/dev/null 2>&1"):
+        log("installing openvswitch-switch")
+        vm_run("apt-get update -q && apt-get install -qy openvswitch-switch")
+
+
+def ensure_bridge():
+    bridge, cidr, gateway = PXE["bridge"], PXE["cidr"], PXE["gateway"]
+    vm_run(f"ovs-vsctl --may-exist add-br {bridge}")
+    vm_run(
+        f"ip addr replace {gateway}/{cidr.split('/')[1]} dev {bridge} && ip link set {bridge} up"
+    )
+    # NAT so composed nodes can reach the internet via the testbed VM
+    # (not needed for commissioning, but required when charms apt-install).
+    vm_run("sysctl -qw net.ipv4.ip_forward=1")
+    vm_run(
+        f"iptables -t nat -C POSTROUTING -s {cidr} ! -d {cidr} -j MASQUERADE 2>/dev/null"
+        f" || iptables -t nat -A POSTROUTING -s {cidr} ! -d {cidr} -j MASQUERADE"
+    )
+    log(f"OVS bridge {bridge} up at {gateway} with NAT for {cidr}")
+
+
+def ensure_maas():
+    if not vm_ok("maas status >/dev/null 2>&1"):
+        log("initialising MAAS region+rack with maas-test-db")
+        vm_run(f"maas init region+rack --database-uri maas-test-db:/// --maas-url {MAAS_URL}")
+    wait_for(
+        "MAAS API",
+        lambda: vm_ok(f"curl -fsS {MAAS_URL}/api/2.0/version/ >/dev/null"),
+        timeout=300,
+        interval=10,
+    )
+    user = MAAS_CFG["admin_user"]
+    if not vm_ok(f"maas apikey --username {user} >/dev/null 2>&1"):
+        log(f"creating MAAS admin user {user}")
+        vm_run(
+            f"maas createadmin --username {user} "
+            f"--password {MAAS_CFG['admin_password']} "
+            f"--email {MAAS_CFG['admin_email']}"
+        )
+    if not vm_ok(f"maas list | grep -q '^{user} '"):
+        vm_run(f'maas login {user} {MAAS_URL} "$(maas apikey --username {user})"')
+    log("MAAS is initialised and the admin profile is logged in")
+
+
+def ensure_subnet_dhcp():
+    rack_controllers = wait_for(
+        "rack controller registration",
+        lambda: maas_json("rack-controllers read"),
+        timeout=600,
+        interval=15,
+    )
+    rack_id = rack_controllers[0]["system_id"]
+
+    cidr = PXE["cidr"]
+    subnet = wait_for(
+        f"subnet {cidr} discovery",
+        lambda: next((s for s in maas_json("subnets read") if s["cidr"] == cidr), None),
+        timeout=300,
+        interval=10,
+    )
+    if subnet.get("gateway_ip") != PXE["gateway"]:
+        maas_json(f"subnet update {subnet['id']} gateway_ip={PXE['gateway']}")
+
+    ranges = maas_json("ipranges read")
+    start = PXE["dhcp_range"]["start"]
+    end = PXE["dhcp_range"]["end"]
+    if not any(r["start_ip"] == start for r in ranges):
+        log(f"creating dynamic DHCP range {start}-{end}")
+        maas_json(f"ipranges create type=dynamic start_ip={start} end_ip={end}")
+
+    vlan = subnet["vlan"]
+    if not vlan["dhcp_on"]:
+        log(f"enabling MAAS DHCP on fabric {vlan['fabric']} vid {vlan['vid']}")
+        maas_json(
+            f"vlan update {vlan['fabric_id']} {vlan['vid']} dhcp_on=true primary_rack={rack_id}"
+        )
+    log("PXE subnet and DHCP configured")
+
+
+def ensure_images():
+    resources = maas_json("boot-resources read")
+    if not any(r["name"].startswith("ubuntu/") and r["type"] == "Synced" for r in resources):
+        log("starting boot image import (this can take a while)")
+        maas_json("boot-resources import", check=False)
+        time.sleep(15)
+    wait_for(
+        "boot image import to finish",
+        lambda: (
+            maas_json("boot-resources is-importing") is False
+            and any(
+                r["name"].startswith("ubuntu/") and r["type"] == "Synced"
+                for r in maas_json("boot-resources read")
+            )
+        ),
+        timeout=3600,
+        interval=30,
+    )
+
+    def rack_synced():
+        racks = maas_json("rack-controllers read")
+        images = maas_json(
+            f"rack-controller list-boot-images {racks[0]['system_id']}", check=False
+        )
+        return images is not None and images.get("status") == "synced"
+
+    wait_for("rack controller image sync", rack_synced, timeout=900, interval=20)
+    log("boot images imported and synced to the rack controller")
+
+
+def ensure_inner_lxd():
+    vm_run("lxd waitready --timeout 120")
+    if not vm_ok("lxc storage show default >/dev/null 2>&1"):
+        vm_run("lxc storage create default dir")
+    if not vm_ok("lxc profile device get default root pool >/dev/null 2>&1"):
+        vm_run("lxc profile device add default root disk path=/ pool=default")
+    bridge = PXE["bridge"]
+    parent = vm_run(
+        "lxc profile device get default eth0 parent", check=False, capture=True
+    ).stdout.strip()
+    if parent != bridge:
+        vm_run("lxc profile device remove default eth0 2>/dev/null || true")
+        vm_run(f"lxc profile device add default eth0 nic nictype=bridged parent={bridge}")
+    address = vm_out("lxc config get core.https_address")
+    if address != f"{PXE['gateway']}:8443":
+        vm_run(f"lxc config set core.https_address {PXE['gateway']}:8443")
+    log("inner LXD initialised (default profile on the PXE bridge)")
+
+
+def ensure_vm_host():
+    name = MAAS_CFG["vm_host_name"]
+    hosts = maas_json("vm-hosts read")
+    if any(h["name"] == name for h in hosts):
+        log(f"VM host {name} already registered")
+        return
+    token = vm_out("lxc config trust add --name maas --quiet")
+    token = token.splitlines()[-1].strip()
+    log(f"registering inner LXD as MAAS VM host {name}")
+    maas_json(
+        f"vm-hosts create type=lxd power_address={PXE['gateway']}:8443 "
+        f"project=default name={name} password={token}"
+    )
+
+
+def ensure_machines():
+    name = MAAS_CFG["vm_host_name"]
+    host_id = next(h["id"] for h in maas_json("vm-hosts read") if h["name"] == name)
+    machines = maas_json("machines read")
+    existing = {m["hostname"] for m in machines}
+    for node in expected_nodes():
+        if node["hostname"] in existing:
+            continue
+        log(
+            f"composing {node['hostname']} "
+            f"({node['cpu']} CPU, {node['memory_mib']} MiB, {node['disk_gib']} GiB)"
+        )
+        maas_json(
+            f"vm-host compose {host_id} cores={node['cpu']} "
+            f"memory={node['memory_mib']} hostname={node['hostname']} "
+            f"storage=main:{node['disk_gib']}"
+        )
+
+    expected = {n["hostname"] for n in expected_nodes()}
+
+    def all_ready():
+        machines = maas_json("machines read")
+        states = {m["hostname"]: m["status_name"] for m in machines if m["hostname"] in expected}
+        failed = {h: s for h, s in states.items() if s.startswith("Failed")}
+        if failed:
+            fatal(f"commissioning failed: {failed}")
+        log(f"machine states: {states}")
+        return len(states) == len(expected) and all(s == "Ready" for s in states.values())
+
+    wait_for("all composed machines to reach Ready", all_ready, timeout=2400, interval=30)
+    log("all composed machines are Ready")
+
+
+def sync_tree():
+    log(f"syncing working tree to {VM}:{VM_TREE}")
+    vm_run(f"mkdir -p {VM_TREE}")
+    excludes = [f"--exclude={e}" for e in SYNC_EXCLUDES]
+    tar_out = subprocess.Popen(
+        ["tar", "-C", str(REPO_ROOT), *excludes, "-cf", "-", "."],
+        stdout=subprocess.PIPE,
+    )
+    untar = subprocess.run(
+        ["lxc", "exec", VM, "--", "tar", "-C", VM_TREE, "-xf", "-"],
+        stdin=tar_out.stdout,
+    )
+    tar_out.wait()
+    if tar_out.returncode != 0 or untar.returncode != 0:
+        fatal("working tree sync failed")
+    vm_run(f"cd {VM_TREE} && uv sync --quiet")
+    log("working tree synced and uv venv created inside the VM")
+
+
+def vm_host_address():
+    """Return the testbed VM's host-side IPv4 address (on the LXD NAT bridge)."""
+    result = host_run(["lxc", "list", VM, "--format", "json"], capture=True)
+    instances = [i for i in json.loads(result.stdout) if i["name"] == VM]
+    if not instances or not instances[0].get("state"):
+        return None
+    for name, net in (instances[0]["state"].get("network") or {}).items():
+        if name == "lo":
+            continue
+        for addr in net.get("addresses", []):
+            if addr["family"] == "inet" and not addr["address"].startswith("10.100."):
+                return addr["address"]
+    return None
+
+
+def report_ui_address():
+    ip = vm_host_address()
+    if ip:
+        log(
+            f"MAAS UI reachable from the host at http://{ip}:5240/MAAS "
+            f"({MAAS_CFG['admin_user']}/{MAAS_CFG['admin_password']})"
+        )
+    else:
+        log("note: could not determine the VM host-side address for the MAAS UI")
+
+
+def cmd_up():
+    ensure_vm()
+    ensure_packages()
+    ensure_bridge()
+    ensure_maas()
+    ensure_subnet_dhcp()
+    ensure_images()
+    ensure_inner_lxd()
+    ensure_vm_host()
+    ensure_machines()
+    sync_tree()
+    report_ui_address()
+    log("testbed is up")
+
+
+# --- other subcommands -------------------------------------------------------
+
+
+def cmd_down():
+    if vm_exists():
+        log(f"deleting VM {VM}")
+        host_run(["lxc", "delete", "--force", VM])
+    else:
+        log(f"VM {VM} does not exist")
+    leftovers = []
+    if vm_exists():
+        leftovers.append(f"VM {VM} still present")
+    for kind in ("profile", "network"):
+        result = host_run(["lxc", kind, "list", "--format", "json"], capture=True)
+        for item in json.loads(result.stdout):
+            if item["name"].startswith("nt-") or item["name"] == PXE["bridge"]:
+                leftovers.append(f"host {kind} {item['name']}")
+    if leftovers:
+        fatal("host-side leftovers found: " + ", ".join(leftovers))
+    log("testbed removed; no host-side leftovers")
+
+
+def cmd_status():
+    result = host_run(["lxc", "list", VM, "--format", "json"], capture=True)
+    instances = [i for i in json.loads(result.stdout) if i["name"] == VM]
+    if not instances:
+        log(f"VM {VM} does not exist (run `nt-testbed up`)")
+        return
+    log(f"VM {VM}: {instances[0]['status']}")
+    if instances[0]["status"] != "Running":
+        return
+    if not vm_ok("maas status >/dev/null 2>&1"):
+        log("MAAS: not initialised")
+        return
+    machines = maas_json("machines read", check=False) or []
+    log(f"MAAS: initialised, {len(machines)} machine(s)")
+    for m in machines:
+        log(f"  {m['hostname']}: {m['status_name']}")
+    hosts = maas_json("vm-hosts read", check=False) or []
+    for h in hosts:
+        used, total = h["used"], h["total"]
+        log(
+            f"  VM host {h['name']}: {used['cores']}/{total['cores']} cores, "
+            f"{used['memory']}/{total['memory']} MiB used"
+        )
+    report_ui_address()
+
+
+def cmd_shell():
+    if vm_ok(f"test -d {VM_TREE}"):
+        os.execvp("lxc", ["lxc", "exec", VM, "--cwd", VM_TREE, "--", "bash", "-l"])
+    os.execvp("lxc", ["lxc", "exec", VM, "--", "bash", "-l"])
+
+
+def verify_foundation():
+    """Assert exactly the composed machines are Ready with expected records."""
+    machines = maas_json("machines read")
+    expected = {n["hostname"] for n in expected_nodes()}
+    actual = {m["hostname"] for m in machines}
+    failures = []
+    if actual != expected:
+        failures.append(f"machine set mismatch: expected {sorted(expected)}, got {sorted(actual)}")
+    for m in machines:
+        if m["hostname"] not in expected:
+            continue
+        if m["status_name"] != "Ready":
+            failures.append(f"{m['hostname']}: status {m['status_name']}, expected Ready")
+        nics = m.get("interface_set", [])
+        if not nics or not all(n.get("mac_address") for n in nics):
+            failures.append(f"{m['hostname']}: missing interface or MAC record")
+        subnets = {
+            link["subnet"]["cidr"]
+            for nic in nics
+            for link in nic.get("links", [])
+            if link.get("subnet")
+        }
+        if PXE["cidr"] not in subnets:
+            failures.append(
+                f"{m['hostname']}: no subnet record for {PXE['cidr']} (has {sorted(subnets)})"
+            )
+    if failures:
+        for failure in failures:
+            log(f"FAIL: {failure}")
+        sys.exit(1)
+    log(f"verify foundation: PASS ({len(expected)} machines Ready on {PXE['cidr']})")
+
+
+VERIFY_STAGES = {"foundation": verify_foundation}
+
+FAULTS = {}  # populated by later stages
+
+
+def cmd_fault(name, args):
+    if name == "clear":
+        log("no faults defined in this stage; nothing to clear")
+        return
+    if name not in FAULTS:
+        fatal(f"unknown fault '{name}'; available: {sorted(FAULTS) or 'none yet'}")
+    FAULTS[name](*args)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="nt-testbed", description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("up", help="create/refresh the whole testbed (idempotent)")
+    sub.add_parser("down", help="delete the testbed VM and check for leftovers")
+    sub.add_parser("status", help="show testbed VM, MAAS, and machine state")
+    sub.add_parser("shell", help="open a shell inside the testbed VM")
+    verify = sub.add_parser("verify", help="run a stage verification")
+    verify.add_argument("stage", choices=sorted(VERIFY_STAGES))
+    fault = sub.add_parser("fault", help="inject or clear a testbed fault")
+    fault.add_argument("name")
+    fault.add_argument("args", nargs="*")
+    args = parser.parse_args()
+
+    if args.command == "up":
+        cmd_up()
+    elif args.command == "down":
+        cmd_down()
+    elif args.command == "status":
+        cmd_status()
+    elif args.command == "shell":
+        cmd_shell()
+    elif args.command == "verify":
+        VERIFY_STAGES[args.stage]()
+    elif args.command == "fault":
+        cmd_fault(args.name, args.args)
+
+
+if __name__ == "__main__":
+    main()

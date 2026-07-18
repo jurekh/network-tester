@@ -1,0 +1,45 @@
+# Declarative testbed topology. The nt-testbed script reads this file; later
+# stages extend it (data VLANs, bonds, rack 2, inter-rack links) without
+# changing the script's command surface.
+
+# Outer LXD VM that contains the whole testbed.
+vm:
+  name: nt-testbed
+  image: ubuntu:24.04
+  cpu: 8
+  memory: 16GiB
+  disk: 100GiB
+  # Reduced profile guidance for smaller hosts is in README.md; lower these
+  # values here if needed (MAAS + 2 nodes fits in 4 CPU / 12GiB).
+
+# Management/PXE network, served by MAAS DHCP inside the testbed VM.
+pxe:
+  bridge: br-rack1
+  cidr: 10.100.1.0/24
+  gateway: 10.100.1.1          # testbed VM address on the bridge
+  dhcp_range: {start: 10.100.1.100, end: 10.100.1.200}
+
+maas:
+  # Snap channel for the maas snap; maas-test-db follows the same channel.
+  # Changing this on an existing testbed requires `nt-testbed down && up`.
+  channel: 3.7/stable
+  admin_user: admin
+  admin_password: testbed
+  admin_email: admin@nt-testbed.local
+  vm_host_name: rack1-lxd
+
+racks:
+  rack-1:
+    nodes:
+      - hostname: r1-data-01
+        cpu: 2
+        memory_mib: 2048
+        disk_gib: 8
+        nics:
+          - bridge: br-rack1
+      - hostname: r1-data-02
+        cpu: 2
+        memory_mib: 2048
+        disk_gib: 8
+        nics:
+          - bridge: br-rack1

@@ -8,7 +8,7 @@ test:
 
 lint:
 	uv run ruff check .
-	uv run ruff format --check cli tests charm/payload
+	uv run ruff format --check cli tests charm/payload testbed/nt-testbed
 
 build:
 	cd charm && charmcraft pack
