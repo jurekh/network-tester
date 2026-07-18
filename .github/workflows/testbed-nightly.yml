@@ -13,8 +13,9 @@ jobs:
   testbed-verify:
     name: Tier 3 - testbed verify matrix
     runs-on: [self-hosted, nested-virt]
-    # A clean build plus the full matrix measures ~3h10m (2026-07-11 run);
-    # leave margin for one transient re-run of a stage.
+    # A clean build plus the full matrix measures ~3h10m-3h20m (2026-07-11 and
+    # 2026-07-18 runs; per-stage timings in testbed/README.md "Reference
+    # timings"); leave margin for one transient re-run of a stage.
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4

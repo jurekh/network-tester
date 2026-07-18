@@ -301,6 +301,29 @@ by rack count (representative sampling), not by node count.
 | `timeout` | low `probe-timeout` -> partial timeout output, inconclusive cross-rack | - | yes |
 | `scale` | Juju accepts a 200-node topology resource (0 units) | - | no (0 units) |
 
+### Reference timings
+
+Measured on a full clean run (fresh `up` + all stages in order) on a 10-CPU /
+24 GiB nt-testbed VM, 2026-07-18; the 2026-07-11 run was within a few minutes
+per stage. Use these to judge whether a run is stuck or merely slow.
+
+| Step | Duration |
+|------|----------|
+| `up` (clean build) | 29-36 min |
+| `verify foundation` | ~5 s |
+| `verify topology` | ~1 min |
+| `verify skeleton` (both passes) | ~50 min |
+| `verify vlan` | ~35 min |
+| `verify bond` | ~28 min |
+| `verify multirack` | ~28 min |
+| `verify timeout` | ~21 min |
+| `verify scale` | ~1 min |
+| **Total** | **~3h10m-3h20m** |
+
+Each deploy-heavy stage logs nothing for 15+ minutes while MAAS deploys the
+nodes; that silence is normal as long as the verify process is alive and
+`maas admin machines read` shows the nodes Deploying/Deployed.
+
 ## CI tiers
 
 The testbed is split into tiers by cost and required runner capability so most
