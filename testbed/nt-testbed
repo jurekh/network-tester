@@ -903,6 +903,26 @@ def ensure_rack2_controller():
         )
     log(f"rack-2 controller {name} registered")
 
+    # Rack-2 nodes PXE boot via this controller's maas-agent boot proxy (port
+    # 5248), which proxies/caches bootloaders from the region. Gate here, before
+    # the rack-2 nodes are recommissioned in ensure_node_networking, on that
+    # proxy actually serving bootx64.efi. A 502 means the agent is unhealthy
+    # (e.g. an incomplete dqlite microcluster bootstrap) and the nodes would
+    # fail to PXE boot and stall in Commissioning; failing fast here attributes
+    # the problem to the rack-2 controller rather than a confusing node-commission
+    # timeout. The check runs inside the container against its own proxy.
+    wait_for(
+        f"{name} boot proxy to serve bootloaders",
+        lambda: vm_ok(
+            f"lxc exec {name} -- curl -fsS -o /dev/null http://localhost:5248/images/bootx64.efi"
+        ),
+        timeout=900,
+        interval=20,
+    )
+    log(
+        f"rack-2 controller {name} boot proxy serving bootloaders (proxied/cached from the region)"
+    )
+
 
 def ensure_rack2_networks():
     """Enable DHCP on the rack-2 PXE segment via the rack-2 controller.
