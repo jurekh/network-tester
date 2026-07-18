@@ -13,7 +13,9 @@ jobs:
   testbed-verify:
     name: Tier 3 - testbed verify matrix
     runs-on: [self-hosted, nested-virt]
-    timeout-minutes: 240
+    # A clean build plus the full matrix measures ~3h10m (2026-07-11 run);
+    # leave margin for one transient re-run of a stage.
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       - name: Preflight - nested KVM available

@@ -8,9 +8,10 @@ in-scope data machine in the target rack. Used by mtu-validator,
 bgp-inference, and the CLI report-generator so all three derive identical
 representative-sampled rack-pair universes.
 
-This file is duplicated at ``cli/representatives.py`` because the charm
-payload cannot import an installed package on nodes. Tests assert the copies
-are byte-identical; edit both together.
+This module is maintained at ``cli/representatives.py`` (canonical) with a
+byte-identical copy at ``charm/payload/representatives.py``, because the charm
+payload cannot import an installed package on nodes. Edit the cli copy and run
+``make sync-shared``; tests assert the copies stay byte-identical.
 """
 
 RULE_CROSS_RACK = "cross-rack-data-routing"
