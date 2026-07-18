@@ -82,6 +82,17 @@ The MAAS version is pinned by `maas.channel` in `topology.yaml`
 Changing the channel does not affect an existing testbed: `up` warns about
 the mismatch and you rebuild with `nt-testbed down && nt-testbed up`.
 
+Juju is installed from the `3.6/stable` snap channel with a minimum version
+of 3.6.25 enforced by `up`. 3.6.25 fixes juju/juju#22691, where Juju deletes
+MAAS machines (including pre-existing VMs recruited into a model) instead of
+releasing them on `destroy-model`/`destroy-controller`; the 3.6.24 regression
+silently destroys testbed node VMs on teardown. Snaps cannot express a
+minimum-version constraint at install, so a pre-existing install below the
+floor (a VM provisioned during the 3.6.24 window) is refreshed on the channel,
+and construction aborts if it is still too old. An already-bootstrapped
+controller keeps its agent version, so a testbed first built on 3.6.24 must be
+rebuilt (`nt-testbed down && nt-testbed up`) to pick up the fix.
+
 ## Usage
 
 ```sh

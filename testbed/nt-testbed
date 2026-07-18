@@ -1494,6 +1494,52 @@ def ensure_maas_bonds():
 JUJU_CONTROLLER = "nt"
 MAAS_CLOUD = "maas-testbed"
 JUJU_APP = "network-tester"  # charm application name the CLI deploys
+JUJU_CHANNEL = "3.6/stable"
+# Minimum acceptable Juju version. 3.6.25 fixes juju/juju#22691, where Juju
+# deletes MAAS machines (including pre-existing VMs recruited into a model)
+# instead of releasing them on destroy-model/destroy-controller. The 3.6.24
+# regression silently destroys testbed node VMs on teardown. Snaps cannot
+# express a minimum-version constraint at install time, so it is enforced here.
+JUJU_MIN_VERSION = (3, 6, 25)
+
+
+def _parse_juju_version(text):
+    """Extract the (major, minor, patch) tuple from `juju version` output."""
+    m = re.match(r"(\d+)\.(\d+)\.(\d+)", text.strip())
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def ensure_juju_version():
+    """Ensure the VM's juju snap is on JUJU_CHANNEL and at least JUJU_MIN_VERSION.
+
+    Installs juju from the pinned channel if absent, then verifies the version.
+    A pre-existing install below the floor (e.g. a VM provisioned during the
+    3.6.24 window) is refreshed on the channel; if it is still too old after
+    that, construction aborts rather than risk node-VM deletion on teardown.
+    """
+    if not vm_ok("snap list juju >/dev/null 2>&1"):
+        log(f"installing snap juju (channel {JUJU_CHANNEL})")
+        vm_run(f"snap install juju --channel={JUJU_CHANNEL}")
+
+    # the strictly confined juju snap cannot create this directory itself,
+    # and even `juju version` aborts without it
+    vm_run("mkdir -p /root/.local/share/juju")
+
+    version = _parse_juju_version(vm_out("juju version"))
+    if version is None:
+        fatal("could not determine the installed juju version")
+    if version < JUJU_MIN_VERSION:
+        want = ".".join(str(x) for x in JUJU_MIN_VERSION)
+        have = ".".join(str(x) for x in version)
+        log(f"juju {have} is below the {want} minimum; refreshing on {JUJU_CHANNEL}")
+        vm_run(f"snap refresh juju --channel={JUJU_CHANNEL}")
+        version = _parse_juju_version(vm_out("juju version"))
+        if version is None or version < JUJU_MIN_VERSION:
+            have = ".".join(str(x) for x in version) if version else "unknown"
+            fatal(
+                f"juju {have} is below the required {want}; "
+                f"{JUJU_CHANNEL} does not yet provide it (see juju/juju#22691)"
+            )
 
 
 def ensure_juju():
@@ -1505,10 +1551,10 @@ def ensure_juju():
     topology under test (design D18). charmcraft is installed so the charm can
     be packed inside the VM when the host lacks charmcraft.
     """
-    for snap, args in (("juju", ""), ("charmcraft", "--classic")):
-        if not vm_ok(f"snap list {snap} >/dev/null 2>&1"):
-            log(f"installing snap {snap}")
-            vm_run(f"snap install {snap} {args}")
+    ensure_juju_version()
+    if not vm_ok("snap list charmcraft >/dev/null 2>&1"):
+        log("installing snap charmcraft")
+        vm_run("snap install charmcraft --classic")
     # the strictly confined juju snap cannot create this directory itself
     vm_run("mkdir -p /root/.local/share/juju")
 
