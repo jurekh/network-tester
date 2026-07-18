@@ -565,90 +565,31 @@ def _wait_pod_networks():
     )
 
 
-def _machine(hostname):
-    return next((m for m in maas_json("machines read") if m["hostname"] == hostname), None)
-
-
-def _delete_machine(node):
-    """Remove a machine and its LXD instance so it can be re-composed clean."""
-    m = _machine(node["hostname"])
-    if m:
-        maas_json(f"machine delete {m['system_id']}", check=False)
-    vm_run(f"lxc delete {node['hostname']} --force", check=False)
-
-
-def _wait_node_settled(hostname, timeout=1200):
-    """Wait for one node to leave the in-progress states; return its status."""
-    active = ("New", "Commissioning", "Testing", "Deploying")
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        m = _machine(hostname)
-        state = m["status_name"] if m else "missing"
-        log(f"{hostname}: {state}")
-        if state not in active:
-            return state
-        time.sleep(20)
-    return "timeout"
-
-
-def _ensure_node(host_id, node):
-    """Compose one node and wait for it to reach Ready before the caller moves on.
-
-    Compose+commission is serialized one node at a time: only that node's tap
-    churns br-rack1 at a time, which keeps rackd from being overwhelmed into
-    dropping the bridge during the commissioning power cycle (a drop strands the
-    LXD BMC power query and fails the commission). A node that still ends up
-    Failed cannot be re-commissioned in place (its BMC power state is stale), so
-    recover by restarting MAAS and re-composing it fresh, a few times.
-    """
-    host = node["hostname"]
-    if (_machine(host) or {}).get("status_name") == "Ready":
-        return
-    for attempt in range(6):
-        if _machine(host) is None:
-            _wait_pod_networks()
-            log(
-                f"composing {host} "
-                f"({node['cpu']} CPU, {node['memory_mib']} MiB, {node['disk_gib']} GiB)"
-            )
-            _compose_machine(host_id, node)
-        if _wait_node_settled(host) == "Ready":
-            return
-        log(
-            f"{host} did not reach Ready (attempt {attempt + 1}); restarting MAAS and re-composing"
-        )
-        restart_maas()
-        _delete_machine(node)
-    fatal(f"{host} failed to reach Ready after repeated re-composes")
-
-
 def ensure_machines():
+    """Compose every expected node, then wait for them all to reach Ready.
+
+    Composes are fired for all not-yet-existing nodes and MAAS commissions them
+    in parallel; the single wait at the end gates `up`. Composing on the Linux
+    PXE bridge (which MAAS reports reliably) and pinning the OVS bridge MACs
+    removed the rackd bridge-drop that earlier forced one-node-at-a-time
+    commissioning, so per-node serialization and its restart/recompose recovery
+    are no longer needed.
+    """
     host_id = next(
         h["id"] for h in maas_json("vm-hosts read") if h["name"] == MAAS_CFG["vm_host_name"]
     )
-    for node in expected_nodes():
-        _ensure_node(host_id, node)
+    existing = {m["hostname"] for m in maas_json("machines read")}
+    to_compose = [n for n in expected_nodes() if n["hostname"] not in existing]
+    if to_compose:
+        _wait_pod_networks()
+        for node in to_compose:
+            log(
+                f"composing {node['hostname']} "
+                f"({node['cpu']} CPU, {node['memory_mib']} MiB, {node['disk_gib']} GiB)"
+            )
+            _compose_machine(host_id, node)
+        wait_nodes_ready(timeout=1800)
     log("all composed machines are Ready")
-
-
-def _recommission_node(host, system_id):
-    """Recommission one node (serialized) and wait for Ready.
-
-    Recover from a bridge-drop that strands the LXD BMC mid-recommission by
-    restarting MAAS, reconciling the power state, and re-issuing the commission.
-    """
-    log(f"recommissioning {host} to record NIC changes")
-    maas_json(f"machine commission {system_id}")
-    if _wait_node_settled(host) == "Ready":
-        return
-    for attempt in range(4):
-        log(f"{host} recommission did not reach Ready (attempt {attempt + 1}); restarting MAAS")
-        restart_maas()
-        maas_json(f"machine query-power-state {system_id}", check=False)
-        maas_json(f"machine commission {system_id}", check=False)
-        if _wait_node_settled(host) == "Ready":
-            return
-    fatal(f"{host} failed to recommission after repeated attempts")
 
 
 def _ensure_forward(cidr):
@@ -1181,7 +1122,10 @@ def ensure_node_networking():
         machine = machines[host]
         if machine["status_name"] != "Ready":
             fatal(f"cannot recommission {host} in state {machine['status_name']}")
-        _recommission_node(host, machine["system_id"])
+        log(f"recommissioning {host} to record NIC changes")
+        maas_json(f"machine commission {machine['system_id']}")
+    if to_commission:
+        wait_nodes_ready(timeout=1800)
 
 
 def ensure_addressing():
