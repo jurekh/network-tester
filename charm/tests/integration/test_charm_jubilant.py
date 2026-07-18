@@ -114,8 +114,15 @@ def test_deploy_trigger_and_collect(juju):
     assert output["status"] == "complete"
     assert output["node"]["system_id"] == "bmc001"
     assert output["node"]["hostname"] == "r1-bmc-01"
-    for section in ("bond_validator", "mtu_validator", "bgp_inference"):
-        assert output[section]["validator_status"] == "complete"
+    assert output["bond_validator"]["validator_status"] == "complete"
+    assert output["bond_validator"]["findings"] == []
+    # Since stage 7 the cross-rack validators are representative-sampled: they
+    # only run on the data-role rack representative. bmc001 is bmc-oam, so they
+    # skip here (and the single-rack fixture has no remote racks anyway); their
+    # complete paths are covered by unit tests and testbed verify multirack.
+    for section in ("mtu_validator", "bgp_inference"):
+        assert output[section]["validator_status"] == "skipped"
+        assert output[section]["skip_reason"] == "not-rack-representative"
         assert output[section]["findings"] == []
     # The LXD machine shares its bridge with the Juju controller and other
     # instances, so the real vlan validator's passive capture may record
