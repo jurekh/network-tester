@@ -2320,7 +2320,17 @@ def verify_timeout():
     if model:
         log("verify timeout: destroying kept model")
         vm_run(f"juju destroy-model --no-prompt --force --timeout 15m {model}", check=False)
-        wait_nodes_ready()
+        # Juju deletes (not just releases) the MAAS machines on destroy-model:
+        # the controller issues op=release then DELETE /machines/<id>, and MAAS
+        # decomposes the VM-host (pod) machines ("Decomposing machine" in the
+        # region log). So the nodes do not return to Ready - they are gone. Wait
+        # for the model to clear; a subsequent `up` re-composes the nodes.
+        wait_for(
+            f"model {model} to be destroyed",
+            lambda: not vm_ok(f"juju show-model {model} >/dev/null 2>&1"),
+            timeout=600,
+            interval=10,
+        )
 
     if problems:
         for problem in problems:
@@ -2364,15 +2374,54 @@ open("/root/nt-scale-topology.json", "w").write(json.dumps(topology))
 """
 
 
+# Deploys the scale charm with the synthetic topology resource through the same
+# libjuju facade the CLI uses for real runs. libjuju runs in the unconfined uv
+# venv (so it reads the charm/resource under /root directly, unlike the strictly
+# confined juju CLI snap) and supports num_units=0, so the application and its
+# resource upload to the controller without ever requesting a MAAS machine. A
+# clean deploy is the empirical proof the controller accepts the resource at
+# this size; get_resources confirms the topology resource registered.
+SCALE_DEPLOY_PY = r"""
+import asyncio
+import sys
+
+from cli.juju_run import LibjujuFacade, APP_NAME
+
+charm, topo, model = sys.argv[1], sys.argv[2], sys.argv[3]
+
+
+async def main():
+    facade = LibjujuFacade()
+    await facade.connect()
+    try:
+        await facade.deploy(model, charm, {"topology": topo})
+        names = []
+        try:
+            m = await facade._model(model)
+            resources = await m.applications[APP_NAME].get_resources()
+            names = sorted(resources.keys())
+        except Exception as exc:
+            print("RESOURCE-ENUM-WARN: %s" % exc)
+        print("RESOURCES: %s" % ",".join(names))
+        print("DEPLOY-OK")
+    finally:
+        await facade.disconnect()
+
+
+asyncio.run(main())
+"""
+
+
 def verify_scale():
     """Phase 8 empirical scale check: the testbed Juju controller accepts a
     synthetic 200-node topology file resource.
 
     The topology resource grows with cluster node count, so this confirms Juju
     accepts it at datacenter scale (the size unit test records the byte budget
-    and the no-chunking decision). The application is deployed with zero units,
-    so no MAAS machines are provisioned: this isolates resource acceptance from
-    node bring-up.
+    and the no-chunking decision). The charm is deployed with num_units=0 via
+    the libjuju facade, so the application and its resource upload to the
+    controller without ever requesting a MAAS machine: this isolates resource
+    acceptance from node bring-up.
     """
     charm_name = ensure_charm_packed()
     sync_tree()
@@ -2385,6 +2434,10 @@ def verify_scale():
     size = int(vm_out("stat -c %s /root/nt-scale-topology.json"))
     log(f"verify scale: 200-node topology resource is {size} bytes")
 
+    # add-model/destroy-model go through the juju CLI (they touch no local
+    # files, so snap confinement is irrelevant); the charm + resource deploy
+    # goes through libjuju (SCALE_DEPLOY_PY) because the confined juju CLI snap
+    # cannot read a local charm or resource file under /root.
     vm_run(
         f"juju destroy-model --no-prompt --force --timeout 5m {model} 2>/dev/null || true",
         check=False,
@@ -2392,24 +2445,27 @@ def verify_scale():
     vm_run(f"juju add-model -c {JUJU_CONTROLLER} {model} {MAAS_CLOUD}")
     try:
         result = vm_run(
-            f"cd {VM_TREE} && juju deploy ./charm/{charm_name} -m {model} "
-            f"--resource topology=/root/nt-scale-topology.json -n 0 {JUJU_APP}",
+            f"cd {VM_TREE} && uv run python - "
+            f"charm/{charm_name} /root/nt-scale-topology.json {model} "
+            f"<<'PY'\n{SCALE_DEPLOY_PY}\nPY",
             check=False,
             capture=True,
         )
-        if result.returncode != 0:
+        out = result.stdout + result.stderr
+        if result.returncode != 0 or "DEPLOY-OK" not in out:
             problems.append(
-                f"Juju rejected the {size}-byte 200-node topology resource:\n"
-                f"{result.stdout}{result.stderr}"
+                f"libjuju deploy of the {size}-byte 200-node topology resource "
+                f"failed:\n{out}"
             )
         else:
-            resources = vm_out(f"juju resources {JUJU_APP} -m {model} --format json", check=False)
-            try:
-                names = {r.get("name") for r in json.loads(resources).get("resources", [])}
-            except (json.JSONDecodeError, AttributeError):
-                names = set()
-            if "topology" not in names:
-                problems.append(f"topology resource not registered after attach:\n{resources}")
+            resource_line = next(
+                (l for l in out.splitlines() if l.startswith("RESOURCES:")), ""
+            )
+            names = resource_line.partition(":")[2].split(",")
+            if "topology" not in [n.strip() for n in names]:
+                problems.append(
+                    f"topology resource not registered after deploy:\n{out}"
+                )
     finally:
         vm_run(
             f"juju destroy-model --no-prompt --force --timeout 5m {model}",
