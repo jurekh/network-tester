@@ -159,6 +159,21 @@ Topology JSON, per-unit probe-output JSON, and final report JSON are contracts b
 
 Validator timeout handling uses cooperative cancellation: a shared cancellation event, tracked subprocesses, and per-command timeouts. Python validator threads are not forcibly killed. On timeout or SIGTERM, the runner terminates tracked subprocesses, lets validators flush partial findings, and writes a timeout- or cancelled-status probe output with per-validator `validator_status` values; started cross-rack validators flush `timeout`/`cancelled` path records for racks they derived but did not attempt.
 
+### D18: Incremental verification testbed: nested virtualization with MAAS, OVS, and FRR on a single machine
+
+Every implementation stage is verified at three levels: unit tests, integration tests, and an end-to-end run in a virtual testbed that emulates the target environment on a single developer machine. The testbed is one outer LXD VM with nested KVM enabled. Inside it: MAAS (region+rack snap, backed by the maas-test-db snap - the testbed is disposable, so an external PostgreSQL buys nothing), an inner LXD registered as a MAAS VM host that composes the node VMs, a Juju controller bootstrapped on the inner LXD and attached to the management network, with the testbed MAAS registered to it as a cloud via `juju add-cloud --controller` (the controller stays outside the topology under test, so data-fabric fault injection cannot sever Juju connectivity, and no composed VM or slow MAAS deploy is spent on it), Open vSwitch bridges acting as ToR switches (VLAN tagging on access ports; OVS bonds with `lacp=active` as the LACP partner for bond validation), and FRR containers acting as ToR routers running eBGP between racks (for BGP inference and cross-rack MTU). The network-tester CLI and Juju client run inside the testbed VM, which plays the operator-workstation role.
+
+Faults are injected by scripts, not by hand: retag an OVS port to put a node on the wrong VLAN, clear LACP on an OVS bond to create a bond mode mismatch, move one bond member to a different bridge to emulate an asymmetric cable swap, `neighbor shutdown` on FRR to break BGP, and set the inter-rack link MTU to create MTU observations. Each stage's testbed increment ships with `verify` and `fault` subcommands so end-to-end verification is repeatable.
+
+The host needs only LXD (plus uv and charmcraft for development); all other state lives inside the testbed VM and `lxc delete --force` removes it completely, keeping a developer laptop clean.
+
+Alternatives considered:
+- GNS3: runs real switch OS images, closest to production switch behavior, but is GUI-centric, heavy to automate headlessly, and LACP-capable switch images carry licensing friction
+- microOVN/OVN: easy clustered overlay networks, but the overlay abstraction hides exactly the L2 details this tool probes; OVN does not naturally model an LACP partner toward hosts or per-port VLAN mistakes
+- Hand-rolled libvirt/Multipass VMs: loses the MAAS VM-host integration that gives PXE commissioning for free
+
+Caveat: OVS approximates but does not equal real ToR switch behavior (LACP state machines, ICMP rate limiting). The virtual testbed validates logic and plumbing; the manual real-hardware runbook remains the final validation gate.
+
 ## Risks / Trade-offs
 
 - [Nodes in different racks deployed at very different times leave early units idle waiting for late units] -> Mitigation: configurable `--wait-timeout` in CLI wrapper; if all expected units don't reach active/idle within timeout, the CLI sets probe-run-id and the report flags missing nodes
