@@ -17,16 +17,18 @@ network-tester CLI runs from there.
 - uv (runs the `nt-testbed` script and its PyYAML dependency)
 - Nested KVM support: `/dev/kvm` present and
   `cat /sys/module/kvm_*/parameters/nested` reports `Y`
-- Default profile: ~24 GB free RAM and ~100 GB free disk
-  (the multi-rack VM is 8 CPU / 20 GiB RAM / 100 GiB disk; the composed
+- Default profile: ~12 host cores, ~28 GB free RAM and ~100 GB free disk
+  (the multi-rack VM is 10 CPU / 24 GiB RAM / 100 GiB disk; the composed
   nodes, the rack-2 controller, and the two FRR routers all run inside it)
 
-Reduced profile for smaller hosts: edit `topology.yaml` and lower `vm.cpu`
-to 4 and `vm.memory` to `12GiB`, and drop the rack-2 node and the
-`rack2`/`routers` sections to run single-rack only; MAAS plus the two
-rack-1 2 GiB nodes still fit, but commissioning is slower. The committed
-`topology.yaml` already uses the multi-rack reduced profile (20 GiB, a
-single rack-2 data node) rather than the 24 GiB design profile.
+The committed `topology.yaml` is the design profile: 10 CPU / 24 GiB with
+two data nodes per rack, so the BGP fallback-target path is exercised on
+both racks. The five composed nodes total 9 vCPUs; MAAS rejects compose
+beyond `vm.cpu` at overcommit 1.0, so `vm.cpu` must exceed the node vCPU
+sum. Reduced profiles for smaller hosts: lower to `8 CPU` / `20GiB` and
+drop the second rack-2 data node (`r2-data-02`) to run one data node in
+rack 2; or lower to `12GiB` and drop the `rack2`/`routers` sections to run
+single-rack only. Both fit, but commissioning is slower.
 
 The MAAS version is pinned by `maas.channel` in `topology.yaml`
 (e.g. `3.7/stable`); the `maas-test-db` snap follows the same channel.
@@ -154,7 +156,17 @@ two distinct MAAS racks to work with:
   `nt-rack2`) land in a different rack from the rack-1 nodes. Rack-2 nodes
   boot on an untagged PXE segment (no tagged management VLAN), which avoids
   a MAAS VLAN-interface mis-link that occurs when extra bridges are present
-  during region init.
+  during region init. That PXE segment is an OVS access VLAN (not the
+  bridge's native VLAN): an untagged OVS port is a trunk that also carries
+  the tagged data VLAN 100, so the data VLAN's broadcast ARP would otherwise
+  leak onto the boot NICs and the vlan-neighbor-validator (which strips the
+  802.1q tag) would read it as data peers on the PXE interface. An access
+  port carries only its own VLAN, so the boot NICs never see the data VLAN;
+  endpoints still see untagged PXE, so MAAS's view is unchanged and the
+  gateway stays on `br-rack2`, which MAAS's scanner ignores (so the region
+  controller gains no interface on the rack-2 PXE subnet). Rack 1 needs no
+  access VLAN: its boot NICs are tagged onto the mgmt VLAN after
+  commissioning, which already isolates them from the data VLAN.
 - One FRR (FRRouting) container per rack acting as the ToR router:
   `frr-rack1` and `frr-rack2`. Each owns its rack's data-subnet gateway
   (`10.100.2.254` / `10.100.6.254`), peers eBGP with the other over an
@@ -180,10 +192,14 @@ cross-rack baseline, then injects three faults via `--reuse-model`:
 - `mtu` (1400): the cross-rack MTU observation drops to ~1400 in both
   directions.
 - `rep-wrong-vlan`: the rack-1 representative's data fabric is broken, so its
-  outbound cross-rack probe is phase-1 gated to inconclusive, and the reverse
-  direction surfaces a target-node warning.
+  outbound cross-rack probe is phase-1 gated to inconclusive. Because each
+  rack has a second data node, the reverse direction reaches rack 1 via the
+  BGP fallback target: the rack-pair stays reachable (a passed check) and the
+  report flags the dead representative with a target-representative-unreachable
+  warning. This run is `--verbose` so the gate can assert that fallback
+  reachability.
 
-The rack-2 controller, both FRR routers, and the rack-2 node are all
+The rack-2 controller, both FRR routers, and the rack-2 data nodes are all
 composed inside the testbed VM, so a multi-rack `up` from scratch runs
 longer than the single-rack build (image import + rack-1 commission + rack-2
 controller/FRR + rack-2 compose/recommission).

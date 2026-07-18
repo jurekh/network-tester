@@ -44,10 +44,23 @@ ROUTERS = CONFIG.get("routers")
 
 
 def rack_net(rack):
-    """Bridge / pxe / vlans for a rack name (rack-1 is the top-level network)."""
+    """Bridge / pxe / vlans for a rack name (rack-1 is the top-level network).
+
+    `bridge` is the rack's OVS bridge that carries the tagged VLANs and bonds
+    (where node mgmt/bond NICs live after the first commission), not the Linux
+    PXE/compose bridge.
+    """
     if rack == "rack-1" or RACK2 is None:
-        return {"bridge": PXE["bridge"], "pxe": PXE, "vlans": VLANS}
-    return {"bridge": RACK2["bridge"], "pxe": RACK2["pxe"], "vlans": RACK2["vlans"]}
+        return {"bridge": PXE["ovs_bridge"], "pxe": PXE, "vlans": VLANS, "pxe_access_vlan": None}
+    return {
+        "bridge": RACK2["bridge"],
+        "pxe": RACK2["pxe"],
+        "vlans": RACK2["vlans"],
+        # OVS access VLAN that isolates the untagged rack-2 PXE segment from the
+        # tagged data VLAN on the shared OVS bridge (rack 1's PXE is a separate
+        # Linux bridge, so it needs none).
+        "pxe_access_vlan": RACK2.get("pxe_access_vlan"),
+    }
 
 
 def all_racks():
@@ -121,6 +134,36 @@ def wait_for(desc, predicate, timeout, interval=10):
     fatal(f"timed out waiting for {desc}")
 
 
+def restart_maas():
+    """Restart MAAS and wait for its API to come back."""
+    log("restarting MAAS")
+    vm_run("snap restart maas")
+    wait_for(
+        "MAAS API",
+        lambda: vm_ok(f"curl -fsS {MAAS_URL}/api/2.0/version/ >/dev/null"),
+        timeout=300,
+        interval=10,
+    )
+
+
+def wait_or_restart(desc, predicate, timeout=180, interval=15):
+    """Wait for predicate; if it stalls, restart MAAS once and wait again.
+
+    MAAS rackd intermittently drops the OVS bridge interfaces (br-rack1,
+    br-rack1.<tag>, br-rack2) from the controller's reported interface set, so
+    interface-discovery waits can stall even though the bridges are up in the
+    VM. A MAAS restart forces a fresh rackd interface scan that restores them.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return
+        time.sleep(interval)
+    log(f"{desc} stalled; restarting MAAS to force a rack-controller interface rescan")
+    restart_maas()
+    wait_for(desc, predicate, timeout=timeout, interval=interval)
+
+
 def expected_nodes():
     nodes = []
     for rack_name, rack in CONFIG["racks"].items():
@@ -191,21 +234,6 @@ def inner_nic_devices(host):
     for name, device in nics.items():
         device["hwaddr"] = (volatile.get(f"volatile.{name}.hwaddr") or "").lower()
     return nics
-
-
-def wait_all_ready(timeout=2400):
-    expected = {n["hostname"] for n in expected_nodes()}
-
-    def all_ready():
-        machines = maas_json("machines read")
-        states = {m["hostname"]: m["status_name"] for m in machines if m["hostname"] in expected}
-        failed = {h: s for h, s in states.items() if s.startswith("Failed")}
-        if failed:
-            fatal(f"commissioning failed: {failed}")
-        log(f"machine states: {states}")
-        return len(states) == len(expected) and all(s == "Ready" for s in states.values())
-
-    wait_for("all composed machines to reach Ready", all_ready, timeout=timeout, interval=30)
 
 
 # --- up steps ----------------------------------------------------------------
@@ -287,12 +315,45 @@ def ensure_packages():
         vm_run("apt-get update -q && apt-get install -qy openvswitch-switch")
 
 
+def pin_bridge_mac(bridge, mac):
+    """Pin an OVS bridge MAC so it never derives from (and flaps with) its
+    member ports.
+
+    An OVS bridge with no other-config:hwaddr takes its MAC from a member port,
+    so when node taps churn the bridge (compose, commission, power cycles) the
+    MAC transiently flaps. The rack controller's interface scan
+    (get_all_interfaces_definition) drops any interface without a MAC, so a
+    flapping bridge MAC makes the rack omit the bridge from its report and the
+    region deletes it. That single drop cascades: pod compose falls back to
+    macvlan (nodes can't reach DHCP), the LXD BMC power query fails ("No rack
+    controllers can access the BMC"), and VLAN-interface discovery stalls. A
+    fixed MAC keeps the bridge continuously present.
+    """
+    vm_run(f"ovs-vsctl set bridge {bridge} other-config:hwaddr={mac}")
+    vm_run(f"ip link set {bridge} address {mac}")
+
+
 def ensure_bridge():
-    bridge, cidr, gateway = PXE["bridge"], PXE["cidr"], PXE["gateway"]
-    vm_run(f"ovs-vsctl --may-exist add-br {bridge}")
+    cidr, gateway = PXE["cidr"], PXE["gateway"]
+    pxe_bridge, ovs_bridge = PXE["bridge"], PXE["ovs_bridge"]
+    # The PXE/BMC/compose segment is a Linux bridge: MAAS's resource scanner
+    # does not report OVS datapath bridges as interfaces, so a pod composed
+    # against an OVS bridge falls back to macvlan (the node then cannot reach
+    # the testbed VM's DHCP, which is the macvlan parent) and the LXD BMC power
+    # query fails. A Linux bridge is reported reliably. Its MAC is pinned so it
+    # never changes with port membership.
+    if not vm_ok(f"ip link show {pxe_bridge} >/dev/null 2>&1"):
+        vm_run(f"ip link add {pxe_bridge} type bridge")
+    vm_run(f"ip link set {pxe_bridge} address 02:00:00:aa:00:01")
     vm_run(
-        f"ip addr replace {gateway}/{cidr.split('/')[1]} dev {bridge} && ip link set {bridge} up"
+        f"ip addr replace {gateway}/{cidr.split('/')[1]} dev {pxe_bridge} && "
+        f"ip link set {pxe_bridge} up"
     )
+    # The OVS bridge carries the tagged mgmt/oam/data VLANs and the LACP bonds.
+    # It has no IP; node mgmt/bond NICs move here (bridged) after commissioning.
+    vm_run(f"ovs-vsctl --may-exist add-br {ovs_bridge}")
+    pin_bridge_mac(ovs_bridge, "02:00:00:aa:01:01")
+    vm_run(f"ip link set {ovs_bridge} up")
     # NAT so composed nodes can reach the internet via the testbed VM
     # (not needed for commissioning, but required when charms apt-install).
     vm_run("sysctl -qw net.ipv4.ip_forward=1")
@@ -300,7 +361,7 @@ def ensure_bridge():
         f"iptables -t nat -C POSTROUTING -s {cidr} ! -d {cidr} -j MASQUERADE 2>/dev/null"
         f" || iptables -t nat -A POSTROUTING -s {cidr} ! -d {cidr} -j MASQUERADE"
     )
-    log(f"OVS bridge {bridge} up at {gateway} with NAT for {cidr}")
+    log(f"PXE Linux bridge {pxe_bridge} up at {gateway}; OVS bridge {ovs_bridge} up; NAT {cidr}")
 
 
 def ensure_maas():
@@ -447,47 +508,147 @@ def ensure_vm_host():
 
 
 def _compose_machine(host_id, node):
-    """Compose one node, tolerating the transient post-registration window.
+    """Compose one node, recovering from MAAS dropping the host bridges.
 
-    Right after the LXD VM host is registered, MAAS has not yet associated
-    the pod host's bridges (br-rack1) with their VLANs, so compose fails with
-    "No host network to attach VM interfaces to". The mapping settles within
-    a minute or two; retry until it does rather than aborting the whole up.
+    Composing a VM creates a tap on the bridge, which makes rackd rescan, and
+    rackd intermittently drops the OVS bridges from its interface report during
+    that rescan. The next compose then fails with "No host network to attach VM
+    interfaces to". A MAAS restart restores the bridge report, so restart and
+    retry on that error (capped) rather than aborting the whole up.
     """
+    host = node["hostname"]
     cmd = (
         f"vm-host compose {host_id} cores={node['cpu']} "
-        f"memory={node['memory_mib']} hostname={node['hostname']} "
+        f"memory={node['memory_mib']} hostname={host} "
         f"storage=main:{node['disk_gib']}"
     )
-    deadline = time.time() + 240
+    restarts = 0
+    cleaned = False
     while True:
         result = vm_run(f"maas {MAAS_CFG['admin_user']} {cmd}", check=False, capture=True)
         if result.returncode == 0:
             return
         out = result.stdout + result.stderr
-        transient = "No host network" in out or "does not match the specified networks" in out
-        if transient and time.time() < deadline:
-            time.sleep(10)
+        if "already exists" in out and not cleaned:
+            # Orphan LXD instance from an interrupted compose (no MAAS record);
+            # remove it and retry.
+            cleaned = True
+            vm_run(f"lxc delete --force {host}", check=False)
             continue
-        fatal(f"compose {node['hostname']} failed ({result.returncode}):\n{out}")
+        transient = "No host network" in out or "does not match the specified networks" in out
+        if transient and restarts < 5:
+            restarts += 1
+            restart_maas()
+            continue
+        fatal(f"compose {host} failed ({result.returncode}):\n{out}")
+
+
+def _wait_pod_networks():
+    """Wait for the rack controller to report the PXE compose bridge to MAAS.
+
+    Pods compose against the Linux PXE bridge (the inner LXD default profile).
+    MAAS must see that bridge in the host controller's interfaces or compose
+    falls back to macvlan ("No host network to attach VM interfaces to" /
+    macvlan NICs that cannot reach DHCP). The Linux bridge is reported
+    reliably, but just after a MAAS restart the rackd rescan may not have run
+    yet; wait for it, restarting MAAS once if it has not appeared.
+    """
+    bridge = PXE["bridge"]
+
+    def discovered():
+        controllers = maas_json("rack-controllers read") or []
+        names = {i["name"] for rc in controllers for i in rc["interface_set"]}
+        return bridge in names
+
+    wait_or_restart(
+        "rack controller to report the PXE bridge", discovered, timeout=90, interval=10
+    )
+
+
+def _machine(hostname):
+    return next((m for m in maas_json("machines read") if m["hostname"] == hostname), None)
+
+
+def _delete_machine(node):
+    """Remove a machine and its LXD instance so it can be re-composed clean."""
+    m = _machine(node["hostname"])
+    if m:
+        maas_json(f"machine delete {m['system_id']}", check=False)
+    vm_run(f"lxc delete {node['hostname']} --force", check=False)
+
+
+def _wait_node_settled(hostname, timeout=1200):
+    """Wait for one node to leave the in-progress states; return its status."""
+    active = ("New", "Commissioning", "Testing", "Deploying")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        m = _machine(hostname)
+        state = m["status_name"] if m else "missing"
+        log(f"{hostname}: {state}")
+        if state not in active:
+            return state
+        time.sleep(20)
+    return "timeout"
+
+
+def _ensure_node(host_id, node):
+    """Compose one node and wait for it to reach Ready before the caller moves on.
+
+    Compose+commission is serialized one node at a time: only that node's tap
+    churns br-rack1 at a time, which keeps rackd from being overwhelmed into
+    dropping the bridge during the commissioning power cycle (a drop strands the
+    LXD BMC power query and fails the commission). A node that still ends up
+    Failed cannot be re-commissioned in place (its BMC power state is stale), so
+    recover by restarting MAAS and re-composing it fresh, a few times.
+    """
+    host = node["hostname"]
+    if (_machine(host) or {}).get("status_name") == "Ready":
+        return
+    for attempt in range(6):
+        if _machine(host) is None:
+            _wait_pod_networks()
+            log(
+                f"composing {host} "
+                f"({node['cpu']} CPU, {node['memory_mib']} MiB, {node['disk_gib']} GiB)"
+            )
+            _compose_machine(host_id, node)
+        if _wait_node_settled(host) == "Ready":
+            return
+        log(
+            f"{host} did not reach Ready (attempt {attempt + 1}); restarting MAAS and re-composing"
+        )
+        restart_maas()
+        _delete_machine(node)
+    fatal(f"{host} failed to reach Ready after repeated re-composes")
 
 
 def ensure_machines():
-    name = MAAS_CFG["vm_host_name"]
-    host_id = next(h["id"] for h in maas_json("vm-hosts read") if h["name"] == name)
-    machines = maas_json("machines read")
-    existing = {m["hostname"] for m in machines}
+    host_id = next(
+        h["id"] for h in maas_json("vm-hosts read") if h["name"] == MAAS_CFG["vm_host_name"]
+    )
     for node in expected_nodes():
-        if node["hostname"] in existing:
-            continue
-        log(
-            f"composing {node['hostname']} "
-            f"({node['cpu']} CPU, {node['memory_mib']} MiB, {node['disk_gib']} GiB)"
-        )
-        _compose_machine(host_id, node)
-
-    wait_all_ready()
+        _ensure_node(host_id, node)
     log("all composed machines are Ready")
+
+
+def _recommission_node(host, system_id):
+    """Recommission one node (serialized) and wait for Ready.
+
+    Recover from a bridge-drop that strands the LXD BMC mid-recommission by
+    restarting MAAS, reconciling the power state, and re-issuing the commission.
+    """
+    log(f"recommissioning {host} to record NIC changes")
+    maas_json(f"machine commission {system_id}")
+    if _wait_node_settled(host) == "Ready":
+        return
+    for attempt in range(4):
+        log(f"{host} recommission did not reach Ready (attempt {attempt + 1}); restarting MAAS")
+        restart_maas()
+        maas_json(f"machine query-power-state {system_id}", check=False)
+        maas_json(f"machine commission {system_id}", check=False)
+        if _wait_node_settled(host) == "Ready":
+            return
+    fatal(f"{host} failed to recommission after repeated attempts")
 
 
 def _ensure_forward(cidr):
@@ -507,7 +668,7 @@ def _ensure_forward(cidr):
 
 def vlan_device(tag):
     """Kernel name of the Linux 802.1q subinterface for a tag on the bridge."""
-    return f"{PXE['bridge']}.{tag}"
+    return f"{PXE['ovs_bridge']}.{tag}"
 
 
 def management_vlans():
@@ -538,7 +699,7 @@ def ensure_vlan_networks():
     mgmt = management_vlans()
     if not mgmt:
         return
-    bridge = PXE["bridge"]
+    bridge = PXE["ovs_bridge"]
     for name, vlan in mgmt:
         tag, cidr, gateway = vlan["tag"], vlan["cidr"], vlan["gateway"]
         dev = vlan_device(tag)
@@ -571,7 +732,9 @@ def ensure_vlan_networks():
                 return False
         return True
 
-    wait_for("rack-controller VLAN interface discovery", discovered, timeout=300, interval=15)
+    wait_or_restart(
+        "rack-controller VLAN interface discovery", discovered, timeout=180, interval=15
+    )
 
     ranges = maas_json("ipranges read")
     for name, vlan in mgmt:
@@ -682,34 +845,36 @@ def _ctrl_ip(gateway):
 
 
 def ensure_rack2_bridge():
-    """OVS bridge br-rack2 for rack 2; the testbed VM owns the rack-2 gateways.
+    """OVS bridge br-rack2 for rack 2; the testbed VM owns the rack-2 gateway.
 
     The testbed VM is the single router for both racks (management/PXE): it
-    owns the rack-2 PXE gateway on the untagged bridge and the rack-2 mgmt
-    gateway on an 802.1q subinterface, NATs rack-2 traffic out, and forwards
-    between racks so MAAS and the Juju controller reach rack-2 over routed
-    management, independent of the data fabric.
+    owns the rack-2 PXE gateway on br-rack2, NATs rack-2 traffic out, and
+    forwards between racks so MAAS and the Juju controller reach rack-2 over
+    routed management, independent of the data fabric.
+
+    The PXE segment is an OVS access VLAN (pxe_access_vlan), not the bridge's
+    untagged native VLAN: an untagged OVS port is a trunk that also carries the
+    tagged data VLAN 100, so the data VLAN's broadcast ARP would leak onto the
+    boot NICs and the vlan-neighbor-validator (which strips the 802.1q tag)
+    would report data peers as unexpected neighbors on the PXE interface. The
+    bridge's own (LOCAL) port carries the gateway on the access VLAN; node and
+    controller PXE NICs join it via their LXD `vlan` setting. Keeping the
+    gateway on br-rack2 (an OVS bridge MAAS's scanner ignores) also means the
+    region controller gains no interface on the rack-2 PXE subnet.
     """
     if RACK2 is None:
         return
     bridge = RACK2["bridge"]
     vm_run(f"ovs-vsctl --may-exist add-br {bridge}")
+    pin_bridge_mac(bridge, "02:00:00:aa:02:01")
     pxe = RACK2["pxe"]
     prefix = pxe["cidr"].split("/")[1]
     vm_run(f"ip addr replace {pxe['gateway']}/{prefix} dev {bridge} && ip link set {bridge} up")
-    nets = [pxe["cidr"]]
-    for vlan in RACK2["vlans"].values():
-        if vlan.get("management"):
-            dev = f"{bridge}.{vlan['tag']}"
-            vprefix = vlan["cidr"].split("/")[1]
-            vm_run(
-                f"ip link show {dev} >/dev/null 2>&1 || "
-                f"ip link add link {bridge} name {dev} type vlan id {vlan['tag']}"
-            )
-            vm_run(
-                f"ip addr replace {vlan['gateway']}/{vprefix} dev {dev} && ip link set {dev} up"
-            )
-        nets.append(vlan["cidr"])
+    # Place the gateway's LOCAL port on the PXE access VLAN so it shares the
+    # nodes' isolated segment (the nodes and controller tag their ports to the
+    # same VLAN); the data VLAN 100 stays on the bond ports only.
+    vm_run(f"ovs-vsctl set port {bridge} tag={RACK2['pxe_access_vlan']}")
+    nets = [pxe["cidr"]] + [vlan["cidr"] for vlan in RACK2["vlans"].values()]
     vm_run("sysctl -qw net.ipv4.ip_forward=1")
     for cidr in nets:
         vm_run(
@@ -717,7 +882,7 @@ def ensure_rack2_bridge():
             f" || iptables -t nat -A POSTROUTING -s {cidr} ! -d {cidr} -j MASQUERADE"
         )
         _ensure_forward(cidr)
-    log(f"OVS bridge {bridge} up; rack-2 gateways and NAT configured")
+    log(f"OVS bridge {bridge} up; rack-2 gateway on PXE access VLAN and NAT configured")
 
 
 def ensure_rack2_controller():
@@ -725,8 +890,10 @@ def ensure_rack2_controller():
 
     A second registered rackd is what makes MAAS derive a distinct rack for
     rack-2 nodes (the fetcher reads each node's boot-VLAN primary rack
-    controller). The container trunks br-rack2: untagged PXE plus an 802.1q
-    mgmt subinterface, mirroring the region's presence on br-rack1.
+    controller). The container's eth1 joins br-rack2 on the PXE access VLAN
+    (the rack-2 nodes' boot segment), so MAAS sees the controller on the same
+    VLAN it serves DHCP to. The access-VLAN tag is OVS-internal: the container
+    sees an untagged interface, so MAAS models it like any PXE NIC.
     """
     if RACK2 is None:
         return
@@ -740,14 +907,14 @@ def ensure_rack2_controller():
             timeout=120,
             interval=5,
         )
-        # Mask the default profile's eth0 (on br-rack1) so the controller lives
-        # only on br-rack2 and MAAS does not associate it with rack 1. Name the
-        # trunk interface eth1 explicitly (LXD's auto-naming is not stable once
-        # eth0 is masked).
+        # Mask the default profile's eth0 (on br-pxe) so the controller lives
+        # only on the rack-2 PXE access VLAN and MAAS does not associate it
+        # with rack 1. Name the interface eth1 explicitly (LXD's auto-naming is
+        # not stable once eth0 is masked).
         vm_run(f"lxc config device add {name} eth0 none")
         vm_run(
             f"lxc config device add {name} trunk nic nictype=bridged "
-            f"parent={RACK2['bridge']} name=eth1"
+            f"parent={RACK2['bridge']} name=eth1 vlan={RACK2['pxe_access_vlan']}"
         )
     pxe = RACK2["pxe"]
     pxe_ip = _ctrl_ip(pxe["gateway"])
@@ -782,7 +949,7 @@ def ensure_rack2_controller():
 def ensure_rack2_networks():
     """Enable DHCP on the rack-2 PXE segment via the rack-2 controller.
 
-    Rack-2 nodes boot on the untagged br-rack2 PXE segment. Wait for MAAS to
+    Rack-2 nodes boot on the br-rack2 PXE access VLAN. Wait for MAAS to
     discover the rack-2 controller's eth1 there, put the rack-2 PXE subnet on
     whatever fabric MAAS auto-linked it to (the subnet follows the interface,
     since VLAN/untagged interfaces cannot be reassigned), and enable DHCP with
@@ -849,7 +1016,7 @@ def ensure_frr_routers():
         f"lxc network show {FRR_LINK_NET} >/dev/null 2>&1 || "
         f"lxc network create {FRR_LINK_NET} ipv4.address=none ipv6.address=none"
     )
-    rack_bridge = {"rack-1": PXE["bridge"], "rack-2": RACK2["bridge"] if RACK2 else None}
+    rack_bridge = {"rack-1": PXE["ovs_bridge"], "rack-2": RACK2["bridge"] if RACK2 else None}
     data_tag = {
         "rack-1": VLANS["data"]["tag"],
         "rack-2": RACK2["vlans"]["data"]["tag"] if RACK2 else None,
@@ -882,11 +1049,21 @@ def ensure_frr_routers():
         vm_run(f"lxc exec {host} -- bash -c {shlex.quote(setup)}")
         if not vm_ok(f"lxc exec {host} -- which vtysh >/dev/null 2>&1"):
             log(f"installing FRR in {host}")
-            vm_run(
+            # apt can fail transiently right after the container boots (mirror
+            # or DNS not ready); retry until vtysh is present or we time out.
+            install = (
                 f"lxc exec {host} -- bash -c "
-                f"'export DEBIAN_FRONTEND=noninteractive; apt-get update -q >/dev/null 2>&1; "
-                f"apt-get install -qy frr >/dev/null 2>&1'"
+                "'export DEBIAN_FRONTEND=noninteractive; "
+                "apt-get update -q && apt-get install -qy frr'"
             )
+            deadline = time.time() + 240
+            while True:
+                vm_run(install, check=False)
+                if vm_ok(f"lxc exec {host} -- which vtysh >/dev/null 2>&1"):
+                    break
+                if time.time() >= deadline:
+                    fatal(f"FRR install in {host} failed after retries")
+                time.sleep(10)
             vm_run(f"lxc exec {host} -- sed -i 's/^bgpd=no/bgpd=yes/' /etc/frr/daemons")
             vm_run(f"lxc exec {host} -- systemctl restart frr")
     _configure_ebgp()
@@ -940,7 +1117,7 @@ def ensure_node_networking():
         names = sorted(devices)
         changed = False
         boot_dev = names[0]
-        # Rack-2 nodes compose on br-rack1 (the inner LXD default profile) and
+        # Rack-2 nodes compose on br-pxe (the inner LXD default profile) and
         # must move their boot NIC to br-rack2 so they commission via the
         # rack-2 controller and MAAS derives rack 2.
         boot_bridge = nics_cfg[0].get("bridge", bridge)
@@ -952,7 +1129,15 @@ def ensure_node_networking():
                 check=False,
             )
             changed = True
-        want_tag = vlans[nics_cfg[0]["vlan"]]["tag"] if nics_cfg[0].get("vlan") else None
+        # A configured boot VLAN tags the NIC onto that VLAN; an untagged boot
+        # NIC on a rack with a PXE access VLAN (rack 2 on the shared OVS bridge)
+        # is tagged onto the access VLAN so the data VLAN cannot reach it. The
+        # access tag is OVS-internal, so the node still sees an untagged NIC.
+        want_tag = (
+            vlans[nics_cfg[0]["vlan"]]["tag"]
+            if nics_cfg[0].get("vlan")
+            else node_net(node)["pxe_access_vlan"]
+        )
         have_tag = devices[boot_dev].get("vlan")
         if want_tag is not None and str(want_tag) != str(have_tag or ""):
             log(f"{host}: tagging boot NIC {boot_dev} onto VLAN {want_tag}")
@@ -996,10 +1181,7 @@ def ensure_node_networking():
         machine = machines[host]
         if machine["status_name"] != "Ready":
             fatal(f"cannot recommission {host} in state {machine['status_name']}")
-        log(f"recommissioning {host} to record NIC changes")
-        maas_json(f"machine commission {machine['system_id']}")
-    if to_commission:
-        wait_all_ready()
+        _recommission_node(host, machine["system_id"])
 
 
 def ensure_addressing():
@@ -2085,8 +2267,11 @@ def _verify_multirack_faults(model):
 
     log("verify multirack: rep-wrong-vlan fault")
     cmd_fault("rep-wrong-vlan", [])
+    # --verbose so the report carries passed_checks: with two data nodes per
+    # rack the reverse direction reaches the broken rep's rack via the BGP
+    # fallback target, and we assert that fallback reachability explicitly.
     rep = report_from_output(
-        (network_tester_run(f"--reuse-model {model} --wait-timeout 1200").stdout or "")
+        (network_tester_run(f"--reuse-model {model} --verbose --wait-timeout 1200").stdout or "")
     )
     if rep is None:
         problems.append("rep-wrong-vlan: no report")
@@ -2096,27 +2281,31 @@ def _verify_multirack_faults(model):
             for e in rep["inconclusive_checks"]
             if e["type"] == "bgp-reachability" and "phase-1 failure" in e.get("note", "")
         ]
-        # The broken node is rack-1's representative, so the reverse direction
-        # (rack-2 -> rack-1) reaches a healthy rack-1 fallback data node: the
-        # warning is target-representative-unreachable (rep down, fallback
-        # answered). target-representative-unhealthy only arises on an outright
-        # cross-rack failure toward the unhealthy rep with no fallback, which a
-        # two-data-node rack never produces. Accept either target-node warning.
-        target_warn = [
-            w
-            for w in rep["warnings"]
-            if w["type"]
-            in ("target-representative-unreachable", "target-representative-unhealthy")
+        # The broken node is rack-1's representative. Both racks have a second
+        # data node, so the reverse direction (rack-2 -> rack-1) does not fail:
+        # the BGP fallback target answers, the rack-pair stays reachable (a
+        # passed bgp-reachability check), and the report flags the dead rep with
+        # a target-representative-unreachable warning. Rack-1's own outbound is
+        # phase-1 gated to inconclusive.
+        fallback_warn = [
+            w for w in rep["warnings"] if w["type"] == "target-representative-unreachable"
         ]
+        fallback_reachable = _bgp_passes(rep)
         if not gated:
             problems.append(
                 "rep-wrong-vlan: expected rack-1 outbound BGP gated to inconclusive:\n"
                 + json.dumps(rep["inconclusive_checks"], indent=2)
             )
-        if not target_warn:
+        if not fallback_warn:
             problems.append(
-                "rep-wrong-vlan: expected reverse-direction target-node warning:\n"
-                + json.dumps(rep["warnings"], indent=2)
+                "rep-wrong-vlan: expected a target-representative-unreachable (fallback) "
+                "warning:\n" + json.dumps(rep["warnings"], indent=2)
+            )
+        if not fallback_reachable:
+            problems.append(
+                "rep-wrong-vlan: expected the reverse rack-pair reachable via the fallback "
+                "target (a passed bgp-reachability check):\n"
+                + json.dumps(rep.get("passed_checks", []), indent=2)
             )
     clear_faults()
     return problems
@@ -2301,7 +2490,7 @@ def fault_bond_swap(args):
     """
     node = _bond_node(args, "bond-swap")
     host = node["hostname"]
-    bridge = PXE["bridge"]
+    bridge = PXE["ovs_bridge"]
     tag = VLANS[node_bond(node)["vlan"]]["tag"]
     ports = _bond_member_ports(node)
     if len(ports) < 2:
@@ -2342,7 +2531,7 @@ def clear_bond():
     reconciler active, so the pause cannot be left to the fault injectors.
     """
     _pause_reconciler()
-    bridge = PXE["bridge"]
+    bridge = PXE["ovs_bridge"]
     for node in expected_nodes():
         if not node_bond(node):
             continue

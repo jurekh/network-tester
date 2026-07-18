@@ -6,12 +6,14 @@
 vm:
   name: nt-testbed
   image: ubuntu:24.04
-  cpu: 8
-  memory: 20GiB
+  cpu: 10
+  memory: 24GiB
   disk: 100GiB
-  # Multi-rack (stage 7) raises this from the single-rack 16GiB. The stage-7
-  # design profile is 24GiB; 20GiB is the reduced profile used here (rack 2 has
-  # a single data node). Lower further on smaller hosts per README.md.
+  # Multi-rack (stage 7) raises this from the single-rack 16GiB/8 CPU. This is
+  # the design profile: 24GiB with two data nodes per rack. CPU is 10 so the
+  # five composed nodes (9 vCPUs total at MAAS overcommit 1.0) fit with room
+  # for the testbed services. A reduced 20GiB/8 CPU profile (rack 2 with a
+  # single data node) fits smaller hosts; see README.md.
 
 maas:
   # Snap channel for the maas snap; maas-test-db follows the same channel.
@@ -27,10 +29,20 @@ maas:
 # onto the VLANs below. The untagged segment keeps the MAAS region, inner LXD
 # API, and the Juju controller container, whose ARP traffic must not appear on
 # the segments the vlan-neighbor-validator captures on.
+#
+# `bridge` is a Linux bridge, not OVS: MAAS's resource scanner does not report
+# OVS datapath bridges as interfaces, so pods composed against an OVS bridge
+# fall back to macvlan (composed VMs then cannot reach the testbed VM's DHCP,
+# which is the macvlan parent) and the LXD BMC power query fails ("no rack
+# controllers can access the BMC"). A Linux bridge is reported reliably, so the
+# PXE/BMC/compose segment lives here. `ovs_bridge` is the OVS bridge that
+# carries the tagged mgmt/oam/data VLANs and the LACP bonds; node NICs move
+# there (bridged) after the first commission.
 pxe:
-  bridge: br-rack1
+  bridge: br-pxe
+  ovs_bridge: br-rack1
   cidr: 10.100.1.0/24
-  gateway: 10.100.1.1          # testbed VM address on the bridge
+  gateway: 10.100.1.1          # testbed VM address on the PXE bridge
   dhcp_range: {start: 10.100.1.100, end: 10.100.1.200}
 
 # Tagged VLANs carried over br-rack1 via OVS access-port tags on the node
@@ -68,15 +80,28 @@ vlans:
 # rack controller container so MAAS derives rack identity from the boot VLAN's
 # primary rack controller. Mirrors rack 1 but on a disjoint address space.
 rack2:
-  bridge: br-rack2
+  bridge: br-rack2              # OVS bridge: PXE access VLAN + data VLAN + bonds
   controller: nt-rack2          # MAAS rack controller (system container)
-  # Rack-2 nodes boot on the untagged br-rack2 PXE segment served by the
-  # rack-2 controller (no tagged management VLAN): MAAS derives a distinct
-  # rack from the boot VLAN's primary rack controller, and this avoids the
+  pxe_access_vlan: 99           # OVS access VLAN isolating PXE from data VLAN 100
+  # Rack-2 nodes boot on the br-rack2 PXE segment served by the rack-2
+  # controller (no tagged management VLAN): MAAS derives a distinct rack from
+  # the boot VLAN's primary rack controller, and an untagged boot avoids the
   # VLAN-interface mis-link MAAS hits when extra bridges exist.
+  #
+  # The PXE segment is an OVS access VLAN (pxe_access_vlan) rather than the
+  # bridge's untagged native VLAN. An untagged OVS port is a trunk that also
+  # carries the tagged data VLAN 100, so the data VLAN's broadcast ARP would
+  # leak onto the boot NICs and the vlan-neighbor-validator (which strips the
+  # 802.1q tag) would report data peers as unexpected neighbors on the PXE
+  # interface. An access port carries only its own VLAN, so the boot NICs never
+  # see the data VLAN. Endpoints still see untagged PXE, so MAAS's view and
+  # DHCP are unchanged, and the gateway stays on br-rack2 (an OVS bridge MAAS's
+  # scanner ignores) so the region controller gains no interface on the rack-2
+  # PXE subnet. Rack 1 needs no access VLAN: its boot NICs are tagged onto the
+  # mgmt VLAN (also isolated from data) after commissioning.
   pxe:
     cidr: 10.101.1.0/24
-    gateway: 10.101.1.1         # testbed VM router address on br-rack2
+    gateway: 10.101.1.1         # testbed VM router address on br-rack2 (access VLAN)
     dhcp_range: {start: 10.101.1.100, end: 10.101.1.200}
   vlans:
     data:
@@ -157,11 +182,25 @@ racks:
         memory_mib: 2048
         disk_gib: 8
         nics:
-          - bridge: br-rack2      # untagged PXE segment served by nt-rack2
+          - bridge: br-rack2      # PXE access VLAN segment served by nt-rack2
             ip: 10.101.1.11
         bond:
           name: bond0
           mode: 802.3ad
           vlan: data
           ip: 10.100.6.11
+          members: 2
+      - hostname: r2-data-02
+        role: data
+        cpu: 2
+        memory_mib: 2048
+        disk_gib: 8
+        nics:
+          - bridge: br-rack2      # PXE access VLAN segment served by nt-rack2
+            ip: 10.101.1.12
+        bond:
+          name: bond0
+          mode: 802.3ad
+          vlan: data
+          ip: 10.100.6.12
           members: 2
