@@ -67,18 +67,15 @@ vlans:
 rack2:
   bridge: br-rack2
   controller: nt-rack2          # MAAS rack controller (system container)
+  # Rack-2 nodes boot on the untagged br-rack2 PXE segment served by the
+  # rack-2 controller (no tagged management VLAN): MAAS derives a distinct
+  # rack from the boot VLAN's primary rack controller, and this avoids the
+  # VLAN-interface mis-link MAAS hits when extra bridges exist.
   pxe:
     cidr: 10.101.1.0/24
-    gateway: 10.101.1.1         # rack-2 controller address on br-rack2
+    gateway: 10.101.1.1         # testbed VM router address on br-rack2
     dhcp_range: {start: 10.101.1.100, end: 10.101.1.200}
   vlans:
-    mgmt:
-      tag: 30
-      management: true
-      fabric: fabric-mgmt-r2
-      cidr: 10.101.4.0/24
-      gateway: 10.101.4.1
-      dhcp_range: {start: 10.101.4.100, end: 10.101.4.200}
     data:
       tag: 100
       fabric: nt-data-r2
@@ -157,9 +154,8 @@ racks:
         memory_mib: 2048
         disk_gib: 8
         nics:
-          - bridge: br-rack2
-            vlan: mgmt
-            ip: 10.101.4.11
+          - bridge: br-rack2      # untagged PXE segment served by nt-rack2
+            ip: 10.101.1.11
         bond:
           name: bond0
           mode: 802.3ad

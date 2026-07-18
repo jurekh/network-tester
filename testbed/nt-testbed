@@ -693,18 +693,24 @@ def ensure_rack2_controller():
             timeout=120,
             interval=5,
         )
-        vm_run(f"lxc config device add {name} trunk nic nictype=bridged parent={RACK2['bridge']}")
+        # Mask the default profile's eth0 (on br-rack1) so the controller lives
+        # only on br-rack2 and MAAS does not associate it with rack 1. Name the
+        # trunk interface eth1 explicitly (LXD's auto-naming is not stable once
+        # eth0 is masked).
+        vm_run(f"lxc config device add {name} eth0 none")
+        vm_run(
+            f"lxc config device add {name} trunk nic nictype=bridged "
+            f"parent={RACK2['bridge']} name=eth1"
+        )
     pxe = RACK2["pxe"]
-    mgmt = RACK2["vlans"]["mgmt"]
-    pxe_ip, mgmt_ip = _ctrl_ip(pxe["gateway"]), _ctrl_ip(mgmt["gateway"])
+    pxe_ip = _ctrl_ip(pxe["gateway"])
     setup = (
         f"ip addr replace {pxe_ip}/{pxe['cidr'].split('/')[1]} dev eth1; ip link set eth1 up; "
-        f"ip link show eth1.{mgmt['tag']} >/dev/null 2>&1 || "
-        f"ip link add link eth1 name eth1.{mgmt['tag']} type vlan id {mgmt['tag']}; "
-        f"ip addr replace {mgmt_ip}/{mgmt['cidr'].split('/')[1]} dev eth1.{mgmt['tag']}; "
-        f"ip link set eth1.{mgmt['tag']} up; "
         f"ip route replace default via {pxe['gateway']}; "
-        f"echo 'nameserver {PXE['gateway']}' > /etc/resolv.conf"
+        # /etc/resolv.conf is a systemd-resolved symlink (127.0.0.53); replace
+        # it with a real resolver reachable via NAT for the snap install.
+        f"rm -f /etc/resolv.conf; "
+        f"printf 'nameserver 1.1.1.1\\nnameserver {PXE['gateway']}\\n' > /etc/resolv.conf"
     )
     vm_run(f"lxc exec {name} -- bash -c {shlex.quote(setup)}")
     if not vm_ok(f"lxc exec {name} -- snap list maas >/dev/null 2>&1"):
@@ -727,11 +733,13 @@ def ensure_rack2_controller():
 
 
 def ensure_rack2_networks():
-    """Model the rack-2 management VLAN and enable DHCP via the rack-2 controller.
+    """Enable DHCP on the rack-2 PXE segment via the rack-2 controller.
 
-    Mirrors ensure_vlan_networks for rack 2: create the fabric/VLAN/subnet,
-    wait for the rack-2 controller's subinterface discovery, then enable DHCP
-    with the rack-2 controller as primary rack so its nodes derive rack-2.
+    Rack-2 nodes boot on the untagged br-rack2 PXE segment. Wait for MAAS to
+    discover the rack-2 controller's eth1 there, put the rack-2 PXE subnet on
+    whatever fabric MAAS auto-linked it to (the subnet follows the interface,
+    since VLAN/untagged interfaces cannot be reassigned), and enable DHCP with
+    the rack-2 controller as primary rack so its nodes derive a distinct rack.
     """
     if RACK2 is None:
         return
@@ -740,37 +748,38 @@ def ensure_rack2_networks():
     if rc is None:
         fatal(f"rack-2 controller {name} not registered")
     rack_id = rc["system_id"]
-    mgmt = RACK2["vlans"]["mgmt"]
-    _fabric, mvlan = _maas_vlan_for(mgmt["fabric"], mgmt["tag"], "mgmt-r2")
-    subnet = next((s for s in maas_json("subnets read") if s["cidr"] == mgmt["cidr"]), None)
-    if subnet is None:
-        log(f"creating MAAS subnet {mgmt['cidr']} for rack-2 mgmt")
-        maas_json(
-            f"subnets create cidr={mgmt['cidr']} vlan={mvlan['id']} gateway_ip={mgmt['gateway']}"
-        )
-    elif subnet["vlan"]["id"] != mvlan["id"]:
-        maas_json(f"subnet update {subnet['id']} vlan={mvlan['id']} gateway_ip={mgmt['gateway']}")
+    pxe = RACK2["pxe"]
 
-    dev = f"eth1.{mgmt['tag']}"
-    wait_for(
-        f"{name} mgmt interface discovery",
-        lambda: _rc_vlan_iface(rack_id, dev) is not None,
+    iface = wait_for(
+        f"{name} eth1 interface discovery",
+        lambda: _rc_vlan_iface(rack_id, "eth1"),
         timeout=300,
         interval=15,
     )
-    rng = mgmt.get("dhcp_range")
+    vlan = iface["vlan"]
+    subnet = next((s for s in maas_json("subnets read") if s["cidr"] == pxe["cidr"]), None)
+    if subnet is None:
+        log(f"creating MAAS subnet {pxe['cidr']} for rack-2 PXE")
+        maas_json(
+            f"subnets create cidr={pxe['cidr']} vlan={vlan['id']} gateway_ip={pxe['gateway']}"
+        )
+    else:
+        if subnet["vlan"]["id"] != vlan["id"]:
+            maas_json(f"subnet update {subnet['id']} vlan={vlan['id']}")
+        if subnet.get("gateway_ip") != pxe["gateway"]:
+            maas_json(f"subnet update {subnet['id']} gateway_ip={pxe['gateway']}")
+
+    rng = pxe.get("dhcp_range")
     ranges = maas_json("ipranges read")
     if rng and not any(r["start_ip"] == rng["start"] for r in ranges):
-        log(f"creating rack-2 mgmt DHCP range {rng['start']}-{rng['end']}")
+        log(f"creating rack-2 PXE DHCP range {rng['start']}-{rng['end']}")
         maas_json(f"ipranges create type=dynamic start_ip={rng['start']} end_ip={rng['end']}")
-    iface = _rc_vlan_iface(rack_id, dev)
-    vlan = iface["vlan"]
     if not vlan["dhcp_on"]:
-        log(f"enabling MAAS DHCP on rack-2 mgmt (primary_rack={name})")
+        log(f"enabling MAAS DHCP on rack-2 PXE (primary_rack={name})")
         maas_json(
             f"vlan update {vlan['fabric_id']} {vlan['vid']} dhcp_on=true primary_rack={rack_id}"
         )
-    log("rack-2 management VLAN configured with DHCP")
+    log("rack-2 PXE segment configured with DHCP")
 
 
 FRR_LINK_NET = "nt-interrack"
@@ -806,9 +815,12 @@ def ensure_frr_routers():
             wait_for(f"{host} agent", lambda h=host: vm_ok(f"lxc exec {h} -- true"), 120, 5)
             vm_run(
                 f"lxc config device add {host} data nic nictype=bridged "
-                f"parent={rack_bridge[rack]} vlan={data_tag[rack]}"
+                f"parent={rack_bridge[rack]} vlan={data_tag[rack]} name=eth1"
             )
-            vm_run(f"lxc config device add {host} link nic nictype=bridged parent={FRR_LINK_NET}")
+            vm_run(
+                f"lxc config device add {host} link nic nictype=bridged "
+                f"parent={FRR_LINK_NET} name=eth2"
+            )
         data_prefix = (
             VLANS["data"]["cidr"].split("/")[1]
             if rack == "rack-1"
@@ -1366,7 +1378,6 @@ def cmd_up():
     ensure_vm()
     ensure_packages()
     ensure_bridge()
-    ensure_rack2_bridge()
     ensure_maas()
     ensure_subnet_dhcp()
     ensure_images()
@@ -1376,6 +1387,9 @@ def cmd_up():
     ensure_vlan_networks()
     ensure_dhcp_rebind()
     ensure_data_segments()
+    # Create br-rack2 only after rack-1's VLAN discovery so its extra bridges
+    # do not perturb MAAS's fabric/VLAN auto-linking for rack 1.
+    ensure_rack2_bridge()
     ensure_inner_lxd()
     ensure_rack2_controller()
     ensure_rack2_networks()
