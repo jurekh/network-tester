@@ -906,19 +906,41 @@ def ensure_rack2_controller():
     # Rack-2 nodes PXE boot via this controller's maas-agent boot proxy (port
     # 5248), which proxies/caches bootloaders from the region. Gate here, before
     # the rack-2 nodes are recommissioned in ensure_node_networking, on that
-    # proxy actually serving bootx64.efi. A 502 means the agent is unhealthy
-    # (e.g. an incomplete dqlite microcluster bootstrap) and the nodes would
-    # fail to PXE boot and stall in Commissioning; failing fast here attributes
-    # the problem to the rack-2 controller rather than a confusing node-commission
-    # timeout. The check runs inside the container against its own proxy.
-    wait_for(
-        f"{name} boot proxy to serve bootloaders",
-        lambda: vm_ok(
+    # proxy actually serving bootx64.efi (the URL nodes fetch over PXE). A 502
+    # means the agent is unhealthy and the nodes would fail to PXE boot and
+    # stall in Commissioning. The check runs inside the container against its
+    # own proxy.
+    def proxy_ready():
+        return vm_ok(
             f"lxc exec {name} -- curl -fsS -o /dev/null http://localhost:5248/images/bootx64.efi"
-        ),
-        timeout=900,
-        interval=20,
-    )
+        )
+
+    desc = f"{name} boot proxy to serve bootloaders"
+    log(f"waiting for {desc} (timeout 300s)")
+    deadline = time.time() + 300
+    while time.time() < deadline and not proxy_ready():
+        time.sleep(20)
+    if not proxy_ready():
+        # Self-heal a known maas-agent failure (LP#2150074, maas-kb
+        # dns-stale-records-after-snap-refresh): an incomplete dqlite
+        # microcluster bootstrap (database/info.yaml without cluster.yaml)
+        # leaves the agent crash-looping, so configure-httpproxy-service never
+        # runs and the boot proxy 502s even after the region import completes.
+        # The documented fix is to stop the snap, delete the microcluster state
+        # dir, and restart so it re-bootstraps. Safe in the testbed: the state
+        # is already broken, and rack registration lives elsewhere (common/).
+        log(
+            f"{desc} stalled (boot proxy 502); applying the maas-agent microcluster "
+            f"reset on {name} per LP#2150074 (maas-kb dns-stale-records-after-snap-refresh): "
+            f"snap stop maas; rm -rf /var/snap/maas/current/microcluster/; snap start maas"
+        )
+        vm_run(
+            f"lxc exec {name} -- bash -c "
+            + shlex.quote(
+                "snap stop maas; rm -rf /var/snap/maas/current/microcluster/; snap start maas"
+            )
+        )
+        wait_for(desc, proxy_ready, timeout=600, interval=20)
     log(
         f"rack-2 controller {name} boot proxy serving bootloaders (proxied/cached from the region)"
     )
