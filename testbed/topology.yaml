@@ -37,9 +37,12 @@ pxe:
 # ports. `management: true` VLANs get a rack-controller presence: a Linux
 # 802.1q subinterface (br-rack1.<tag>) on the bridge LOCAL port (an OVS
 # trunk), which MAAS discovers natively as a vid-tagged VLAN interface and
-# serves DHCP on. Each management VLAN is its own fabric. The data VLAN has a
-# gateway only since stage 7: the rack-1 ToR router (FRR) owns gateway_ip so
-# cross-rack traffic routes; same-rack L2 neighbor checks are unaffected.
+# serves DHCP on. MAAS places each discovered subinterface on a vid-tagged
+# VLAN of the bridge's own fabric (fabric-0); the subnet/DHCP follow that
+# discovered VLAN (the `fabric:` keys below are descriptive only). The data
+# VLAN has a gateway only since stage 7: the rack-1 ToR router (FRR) owns
+# gateway_ip so cross-rack traffic routes; same-rack L2 neighbor checks are
+# unaffected.
 vlans:
   mgmt:
     tag: 30

@@ -101,13 +101,28 @@ def test_binary_search_finds_intermediate_mtu(monkeypatch):
     assert r["observation_status"] == "success"
 
 
-def test_frag_needed_records_indicated_mtu(monkeypatch):
-    # 8972 fails with an ICMP fragmentation-needed reporting mtu 1500
-    fake = FakePing(ok_if=lambda s: False, frag={8972: 1500})
+def test_jumbo_frag_reports_downstream_mtu(monkeypatch):
+    # Jumbo-capable local interface: the standard size passes, and the jumbo
+    # probe leaves the interface and fragments at a real downstream hop above
+    # 1500 (reporting mtu 4000), which is the path MTU.
+    fake = FakePing(ok_if=lambda s: s <= 1472, frag={8972: 4000})
     monkeypatch.setattr(mtu, "_ping_df", fake)
     section = run()
     r = section["cross_rack_mtu"][0]
-    assert r["observed_path_mtu_bytes"] == 1500
+    assert r["observed_path_mtu_bytes"] == 4000
+    assert r["observation_status"] == "success"
+
+
+def test_path_mtu_below_local_interface_records_smaller(monkeypatch):
+    # The local interface is 1500, so the jumbo probe fragments at the local
+    # MTU and reports 1500; the true path bottleneck is 1400, which only the
+    # standard-size probe reveals (it fragments reporting 1400). The validator
+    # must report 1400, not the local-interface 1500.
+    fake = FakePing(ok_if=lambda s: False, frag={8972: 1500, 1472: 1400})
+    monkeypatch.setattr(mtu, "_ping_df", fake)
+    section = run()
+    r = section["cross_rack_mtu"][0]
+    assert r["observed_path_mtu_bytes"] == 1400
     assert r["observation_status"] == "success"
 
 

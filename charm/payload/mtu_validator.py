@@ -57,20 +57,37 @@ def _ping_df(ip, size, cancellation):
 
 
 def _measure_mtu(ip, cancellation):
-    """Return (observed_path_mtu_bytes|None, observation_status) for one path."""
-    hi_ok, hi_frag = _ping_df(ip, JUMBO_PAYLOAD, cancellation)
-    if hi_ok:
-        return JUMBO_PAYLOAD + HEADER_BYTES, "success"
-    if hi_frag:
-        return hi_frag, "success"
+    """Return (observed_path_mtu_bytes|None, observation_status) for one path.
+
+    The standard-size probe (1500 total) is sent first: it fits a standard
+    1500 interface, so it actually leaves the host and any fragmentation it
+    triggers reflects a real downstream bottleneck (e.g. a 1400 inter-rack
+    link). A jumbo-first probe cannot see a sub-1500 path MTU on a 1500
+    interface, because the oversized packet fragments at the local interface
+    and the kernel reports the local 1500 MTU, masking the smaller path.
+    """
     lo_ok, lo_frag = _ping_df(ip, STD_PAYLOAD, cancellation)
     if not lo_ok:
         if lo_frag:
             return lo_frag, "success"
         return None, "inconclusive"
 
-    # 1472 works, 8972 does not: binary search the payload range for the
-    # largest size that still passes; the path MTU is that size + 28.
+    # Standard size passes; probe jumbo to detect a larger (jumbo) path MTU.
+    hi_ok, hi_frag = _ping_df(ip, JUMBO_PAYLOAD, cancellation)
+    if hi_ok:
+        return JUMBO_PAYLOAD + HEADER_BYTES, "success"
+    if hi_frag and hi_frag > STD_PAYLOAD + HEADER_BYTES:
+        # The probe left a jumbo-capable interface and fragmented at a real
+        # downstream hop above 1500: that reported MTU is the path MTU.
+        return hi_frag, "success"
+    if hi_frag:
+        # The jumbo probe fragmented at the local interface (report <= 1500):
+        # the path MTU is the standard size that already passed.
+        return STD_PAYLOAD + HEADER_BYTES, "success"
+
+    # Jumbo failed without a fragmentation report (ICMP frag-needed filtered):
+    # binary search the payload range for the largest size that still passes;
+    # the path MTU is that size + 28.
     best = STD_PAYLOAD
     low, high = STD_PAYLOAD, JUMBO_PAYLOAD
     for _ in range(BINARY_SEARCH_ITERATIONS):
@@ -81,7 +98,7 @@ def _measure_mtu(ip, cancellation):
         if ok:
             best = mid
             low = mid
-        elif frag:
+        elif frag and frag > STD_PAYLOAD + HEADER_BYTES:
             return frag, "success"
         else:
             high = mid

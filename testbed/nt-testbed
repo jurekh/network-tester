@@ -446,6 +446,32 @@ def ensure_vm_host():
     )
 
 
+def _compose_machine(host_id, node):
+    """Compose one node, tolerating the transient post-registration window.
+
+    Right after the LXD VM host is registered, MAAS has not yet associated
+    the pod host's bridges (br-rack1) with their VLANs, so compose fails with
+    "No host network to attach VM interfaces to". The mapping settles within
+    a minute or two; retry until it does rather than aborting the whole up.
+    """
+    cmd = (
+        f"vm-host compose {host_id} cores={node['cpu']} "
+        f"memory={node['memory_mib']} hostname={node['hostname']} "
+        f"storage=main:{node['disk_gib']}"
+    )
+    deadline = time.time() + 240
+    while True:
+        result = vm_run(f"maas {MAAS_CFG['admin_user']} {cmd}", check=False, capture=True)
+        if result.returncode == 0:
+            return
+        out = result.stdout + result.stderr
+        transient = "No host network" in out or "does not match the specified networks" in out
+        if transient and time.time() < deadline:
+            time.sleep(10)
+            continue
+        fatal(f"compose {node['hostname']} failed ({result.returncode}):\n{out}")
+
+
 def ensure_machines():
     name = MAAS_CFG["vm_host_name"]
     host_id = next(h["id"] for h in maas_json("vm-hosts read") if h["name"] == name)
@@ -458,11 +484,7 @@ def ensure_machines():
             f"composing {node['hostname']} "
             f"({node['cpu']} CPU, {node['memory_mib']} MiB, {node['disk_gib']} GiB)"
         )
-        maas_json(
-            f"vm-host compose {host_id} cores={node['cpu']} "
-            f"memory={node['memory_mib']} hostname={node['hostname']} "
-            f"storage=main:{node['disk_gib']}"
-        )
+        _compose_machine(host_id, node)
 
     wait_all_ready()
     log("all composed machines are Ready")
@@ -481,18 +503,6 @@ def _ensure_forward(cidr):
             f"iptables -C FORWARD {spec} -j ACCEPT 2>/dev/null"
             f" || iptables -A FORWARD {spec} -j ACCEPT"
         )
-
-
-def _maas_vlan_for(fabric_name, tag, name):
-    """Find or create a MAAS fabric+VLAN for a tag; return (fabric, vlan)."""
-    fabric = next((f for f in maas_json("fabrics read") if f["name"] == fabric_name), None)
-    if fabric is None:
-        log(f"creating MAAS fabric {fabric_name}")
-        fabric = maas_json(f"fabrics create name={fabric_name}")
-    mvlan = next((v for v in maas_json(f"vlans read {fabric['id']}") if v["vid"] == tag), None)
-    if mvlan is None:
-        mvlan = maas_json(f"vlans create {fabric['id']} vid={tag} name={name}")
-    return fabric, mvlan
 
 
 def vlan_device(tag):
@@ -518,11 +528,12 @@ def ensure_vlan_networks():
     subinterface (br-rack1.<tag>) on the bridge LOCAL port, which is an OVS
     trunk. MAAS discovers these natively as vid-tagged VLAN interfaces and
     serves DHCP on them; OVS bridges their frames to the nodes' access-tagged
-    ports. Pre-creating the fabric/VLAN/subnet lets MAAS link the discovered
-    interface to the right VLAN by IP. The data VLAN has no controller
-    presence (ensure_data_segments models it as its own data fabric). Run
-    before the inner LXD exists so the controller refresh sees a stable
-    interface set.
+    ports. MAAS places each discovered subinterface on a vid-tagged VLAN of
+    the bridge's own fabric (fabric-0), so the subnet/range/DHCP bind to that
+    discovered VLAN rather than a separate pre-created fabric. The data VLAN
+    has no controller presence (ensure_data_segments models it as its own
+    data fabric). Run before the inner LXD exists so the controller refresh
+    sees a stable interface set.
     """
     mgmt = management_vlans()
     if not mgmt:
@@ -544,19 +555,15 @@ def ensure_vlan_networks():
         _ensure_forward(cidr)
 
     rack_id = maas_json("rack-controllers read")[0]["system_id"]
-    for name, vlan in mgmt:
-        tag, cidr, gateway = vlan["tag"], vlan["cidr"], vlan["gateway"]
-        fabric_name = vlan.get("fabric", f"fabric-{name}")
-        _fabric, mvlan = _maas_vlan_for(fabric_name, tag, name)
-        subnet = next((s for s in maas_json("subnets read") if s["cidr"] == cidr), None)
-        if subnet is None:
-            log(f"creating MAAS subnet {cidr} for VLAN {name}")
-            maas_json(f"subnets create cidr={cidr} vlan={mvlan['id']} gateway_ip={gateway}")
-        elif subnet["vlan"]["id"] != mvlan["id"]:
-            maas_json(f"subnet update {subnet['id']} vlan={mvlan['id']} gateway_ip={gateway}")
-        elif subnet.get("gateway_ip") != gateway:
-            maas_json(f"subnet update {subnet['id']} gateway_ip={gateway}")
 
+    # MAAS models an 802.1q subinterface on br-rack1 as a vid-tagged VLAN on
+    # the bridge's own fabric (fabric-0); it does not place it on a separate
+    # pre-created fabric, and a vlan-type interface cannot be reassigned to
+    # another fabric afterwards. So wait for the rack controller to discover
+    # each subinterface, then bind that discovered VLAN's subnet, dynamic
+    # range, and DHCP to it (subnet follows interface). Doing this before
+    # discovery races the controller refresh: the subnet lands on a stale
+    # fabric and DHCP cannot be enabled on the interface's real VLAN.
     def discovered():
         for name, vlan in mgmt:
             iface = _rc_vlan_iface(rack_id, vlan_device(vlan["tag"]))
@@ -568,15 +575,23 @@ def ensure_vlan_networks():
 
     ranges = maas_json("ipranges read")
     for name, vlan in mgmt:
-        tag, fabric_name = vlan["tag"], vlan.get("fabric", f"fabric-{name}")
+        tag, cidr, gateway = vlan["tag"], vlan["cidr"], vlan["gateway"]
+        iface = _rc_vlan_iface(rack_id, vlan_device(tag))
+        mvlan = iface["vlan"]
+        subnet = next((s for s in maas_json("subnets read") if s["cidr"] == cidr), None)
+        if subnet is None:
+            log(f"creating MAAS subnet {cidr} for VLAN {name}")
+            maas_json(f"subnets create cidr={cidr} vlan={mvlan['id']} gateway_ip={gateway}")
+        elif subnet["vlan"]["id"] != mvlan["id"]:
+            maas_json(f"subnet update {subnet['id']} vlan={mvlan['id']} gateway_ip={gateway}")
+        elif subnet.get("gateway_ip") != gateway:
+            maas_json(f"subnet update {subnet['id']} gateway_ip={gateway}")
         rng = vlan.get("dhcp_range")
         if rng and not any(r["start_ip"] == rng["start"] for r in ranges):
             log(f"creating dynamic DHCP range for VLAN {name}: {rng['start']}-{rng['end']}")
             maas_json(f"ipranges create type=dynamic start_ip={rng['start']} end_ip={rng['end']}")
-        iface = _rc_vlan_iface(rack_id, vlan_device(tag))
-        mvlan = iface["vlan"]
         if not mvlan["dhcp_on"]:
-            log(f"enabling MAAS DHCP on VLAN {name} (fabric {fabric_name})")
+            log(f"enabling MAAS DHCP on VLAN {name} (fabric {mvlan['fabric_id']} vid {tag})")
             maas_json(
                 f"vlan update {mvlan['fabric_id']} {mvlan['vid']} "
                 f"dhcp_on=true primary_rack={rack_id}"
@@ -624,6 +639,38 @@ def ensure_data_segments():
                 maas_json(f"subnet update {subnet['id']} vlan={mvlan['id']}")
             if gw and subnet.get("gateway_ip") != gw:
                 maas_json(f"subnet update {subnet['id']} gateway_ip={gw}")
+
+
+def ensure_data_routes():
+    """MAAS static routes so each rack's data subnet reaches the other's via
+    its own FRR ToR.
+
+    The data nodes default-route through their PXE/mgmt NIC (so MAAS and the
+    Juju controller stay reachable independent of the data fabric), so a data
+    subnet's FRR gateway_ip alone does not give a node a route to the remote
+    rack's data subnet: cross-rack data traffic would follow the default route
+    off the testbed instead of via BGP. These static routes are rendered into
+    the deployed nodes' netplan as a route to the remote data subnet through
+    the local FRR gateway.
+    """
+    if not (RACK2 and ROUTERS):
+        return
+    subnets = {s["cidr"]: s["id"] for s in maas_json("subnets read")}
+    r1_cidr, r2_cidr = VLANS["data"]["cidr"], RACK2["vlans"]["data"]["cidr"]
+    pairs = [
+        (r1_cidr, r2_cidr, ROUTERS["rack-1"]["data_ip"]),
+        (r2_cidr, r1_cidr, ROUTERS["rack-2"]["data_ip"]),
+    ]
+    existing = maas_json("static-routes read") or []
+    for src_cidr, dst_cidr, gw in pairs:
+        src_id, dst_id = subnets.get(src_cidr), subnets.get(dst_cidr)
+        if src_id is None or dst_id is None:
+            fatal(f"data route {src_cidr} -> {dst_cidr}: subnet not found in MAAS")
+        if any(r["source"]["id"] == src_id and r["destination"]["id"] == dst_id for r in existing):
+            continue
+        log(f"adding cross-rack data route {src_cidr} -> {dst_cidr} via {gw}")
+        maas_json(f"static-routes create source={src_id} destination={dst_id} gateway_ip={gw}")
+    log("cross-rack data routes configured")
 
 
 # --- rack 2 (stage 7) --------------------------------------------------------
@@ -855,6 +902,10 @@ def _configure_ebgp():
         cmds = (
             "conf t",
             f"router bgp {cfg['asn']}",
+            # FRR 8.4 drops all eBGP prefixes unless an explicit policy exists;
+            # this is a lab ToR with no filtering, so disable that requirement
+            # and let redistribute connected advertise each rack's data subnet.
+            "no bgp ebgp-requires-policy",
             f"neighbor {peer_cfg['link_ip']} remote-as {peer_cfg['asn']}",
             "redistribute connected",
             "end",
@@ -1301,10 +1352,16 @@ def ensure_juju():
     vm_run(f"juju add-credential {MAAS_CLOUD} -f /root/nt-cred.yaml --client 2>/dev/null || true")
     if MAAS_CLOUD not in controller_json("credentials", "controller-credentials"):
         log(f"adding MAAS credential for cloud {MAAS_CLOUD}")
+        # add-credential --controller still adds the controller credential but
+        # exits non-zero when the client-local copy added above already exists
+        # ("credential already exists locally"); tolerate that and verify the
+        # controller credential actually landed.
         vm_run(
             f"juju add-credential {MAAS_CLOUD} -f /root/nt-cred.yaml "
-            f"--controller {JUJU_CONTROLLER}"
+            f"--controller {JUJU_CONTROLLER} || true"
         )
+        if MAAS_CLOUD not in controller_json("credentials", "controller-credentials"):
+            fatal(f"failed to add MAAS credential to controller {JUJU_CONTROLLER}")
     log(f"Juju controller {JUJU_CONTROLLER} is up with cloud {MAAS_CLOUD} registered")
 
 
@@ -1394,6 +1451,7 @@ def cmd_up():
     ensure_rack2_controller()
     ensure_rack2_networks()
     ensure_frr_routers()
+    ensure_data_routes()
     ensure_vm_host()
     ensure_machines()
     ensure_node_networking()
@@ -2038,8 +2096,17 @@ def _verify_multirack_faults(model):
             for e in rep["inconclusive_checks"]
             if e["type"] == "bgp-reachability" and "phase-1 failure" in e.get("note", "")
         ]
+        # The broken node is rack-1's representative, so the reverse direction
+        # (rack-2 -> rack-1) reaches a healthy rack-1 fallback data node: the
+        # warning is target-representative-unreachable (rep down, fallback
+        # answered). target-representative-unhealthy only arises on an outright
+        # cross-rack failure toward the unhealthy rep with no fallback, which a
+        # two-data-node rack never produces. Accept either target-node warning.
         target_warn = [
-            w for w in rep["warnings"] if w["type"] == "target-representative-unhealthy"
+            w
+            for w in rep["warnings"]
+            if w["type"]
+            in ("target-representative-unreachable", "target-representative-unhealthy")
         ]
         if not gated:
             problems.append(
@@ -2267,7 +2334,14 @@ def clear_bond():
     while the nodes are deployed); for powered-off nodes it just clears any
     fault-only bonds and lets the reconciler rebuild on the next boot. The
     reconciler stays paused until every node is restored, then resumes.
+
+    Pause first: build_ovs_bond del-ports each bond before re-adding it, and an
+    unpaused reconciler would see the transient mismatch and rebuild the bond
+    itself, racing the add-bond ("port already exists"). This clear runs after
+    every fault, including non-bond faults (bgp-down, mtu) that leave the
+    reconciler active, so the pause cannot be left to the fault injectors.
     """
+    _pause_reconciler()
     bridge = PXE["bridge"]
     for node in expected_nodes():
         if not node_bond(node):
