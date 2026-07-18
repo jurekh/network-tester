@@ -79,9 +79,19 @@ Exactly one targeting mode is required (mutually exclusive):
 | Mode | Flag | Selects |
 |------|------|---------|
 | All | `--all` | every machine in MAAS `Ready` state |
-| Rack | `--rack NAME [NAME ...]` | machines in one or more named racks |
+| Rack | `--rack NAME [NAME ...]` | machines in one or more named racks (see below) |
 | Nodes | `--nodes ID [ID ...]` | hand-picked machines by `system_id` or hostname |
 | Reuse | `--reuse-model MODEL` | re-trigger probes on an existing model and collect (no new deploy) |
+
+A **rack NAME is a rack controller's hostname**. A machine's rack is derived,
+not stored: it is the hostname of the **primary rack controller of the
+machine's boot-interface VLAN** (falling back to any other interface's VLAN,
+and to the sole rack controller if only one is registered). This mirrors MAAS,
+where the controller that serves a VLAN's DHCP/PXE defines its rack. Names are
+matched exactly (case-sensitive); an unknown name fails with
+`Unknown rack: X. Available racks: ...`. Only machines in MAAS `Ready` state are
+eligible. To see each machine's derived rack, run with `--dry-run` (or `--all
+--dry-run`): the plan prints `rack=<name>` per selected node.
 
 Examples:
 

@@ -20,7 +20,12 @@ def build_parser():
     run = sub.add_parser("run", help="fetch topology, deploy probes, and report")
     run.add_argument("--all", action="store_true", help="target all machines in Ready state")
     run.add_argument(
-        "--rack", nargs="+", metavar="NAME", help="target machines in one or more racks"
+        "--rack",
+        nargs="+",
+        metavar="NAME",
+        help="target machines in one or more racks; a rack NAME is a rack "
+        "controller hostname, and a machine's rack is the primary rack "
+        "controller of its boot-interface VLAN (names match exactly)",
     )
     run.add_argument(
         "--nodes",
