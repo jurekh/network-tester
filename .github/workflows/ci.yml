@@ -6,16 +6,22 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+# One run per branch/PR; superseded runs are cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   tier1-lint-test:
     name: Tier 1 - lint + unit/integration tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v8
       - name: Lint
         run: make lint
       - name: Test
@@ -25,18 +31,18 @@ jobs:
     name: Tier 2 - jubilant charm integration (LXD)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v8
       - name: Set up LXD and Juju
-        uses: charmed-kubernetes/actions-operator@main
+        # main pinned to the 2026-07-19 commit verified green here; bump deliberately.
+        uses: charmed-kubernetes/actions-operator@d8217ad61c15f746727a9d41563c13e9b9fe56e3
         with:
           provider: lxd
           juju-channel: 3.6/stable
       - name: Pack the charm
-        run: |
-          sudo snap install charmcraft --classic
-          cd charm && charmcraft pack
+        # charmcraft is installed by actions-operator above.
+        run: cd charm && charmcraft pack
       - name: Run jubilant integration tests
         env:
           CHARM_PATH: ${{ github.workspace }}/charm/network-tester_amd64.charm

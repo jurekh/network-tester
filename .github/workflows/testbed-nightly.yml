@@ -18,7 +18,7 @@ jobs:
     # timings"); leave margin for one transient re-run of a stage.
     timeout-minutes: 300
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Preflight - nested KVM available
         run: |
           test -e /dev/kvm
