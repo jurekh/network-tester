@@ -42,4 +42,4 @@ jobs:
           CHARM_PATH: ${{ github.workspace }}/charm/network-tester_amd64.charm
         run: |
           cd charm
-          uv tool run --from tox tox -e integration
+          uv tool run --from tox --with tox-uv tox -e integration
